@@ -13,3 +13,4 @@ dist/
 xcuserdata/
 DerivedData/
 *.xcuserstate
+spacetime.local.json
