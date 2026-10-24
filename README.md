@@ -13,3 +13,9 @@ A scam-call screener. A server answers unknown calls, screens them by voice (Car
 
 1. Copy `.env.example` to `.env` and fill it in. `.env` and `.mcp.json` are gitignored: never commit keys.
 2. `cd server && npm install && npm run dev`, then check `GET http://localhost:3000/health`.
+3. commands to install packages and dependencies:
+   npm install express
+   npm install -D typescript tsx @types/node @types/express
+
+4. To run:
+   npm run dev
