@@ -1,0 +1,15 @@
+# Secrets: never commit keys (Cartesia track rules: no API keys or secrets in the repo)
+.env
+.env.*
+!.env.example
+.mcp.json
+
+# Dependencies and build output
+node_modules/
+dist/
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+DerivedData/
+*.xcuserstate
