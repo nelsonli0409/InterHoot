@@ -1,6 +1,9 @@
-
+import "dotenv/config";
 import twilio from "twilio";
 import type { CallVerdict } from "../agent/conversation.js";
+
+const UNCONNECTED_CLOSING_MESSAGE =
+  "Thank you for calling InterHoot. We are unable to connect your call at this time. Goodbye!";
 
 export function buildVerdictTwiml(
   verdict: CallVerdict,
@@ -9,44 +12,28 @@ export function buildVerdictTwiml(
   const response = new twilio.twiml.VoiceResponse();
 
   if (verdict === "GREEN") {
-    if (!protectedNumber) {
-      throw new Error(
-        "A protected phone number is required for GREEN calls."
+    if (protectedNumber) {
+      response.say("Your call has been approved. Connecting you now.");
+      response.dial(protectedNumber);
+    } else {
+      response.say(
+        "Thank you for calling InterHoot! Your call has been successfully screened. " +
+          "We're unable to connect you at this time. " +
+          "We appreciate your patience. Have a wonderful day. Goodbye!"
       );
+      response.hangup();
     }
-
-    response.say(
-      "Your call has been approved. Connecting you now."
-    );
-
-    response.dial(protectedNumber);
-
     return response.toString();
   }
 
-  if (verdict === "YELLOW") {
-    response.say(
-      "We cannot connect your call at this time. Goodbye."
-    );
-
+  if (verdict === "YELLOW" || verdict === "RED") {
+    response.say(UNCONNECTED_CLOSING_MESSAGE);
     response.hangup();
-
-    return response.toString();
-  }
-
-  if (verdict === "RED") {
-    response.say(
-      "This call cannot be connected. Goodbye."
-    );
-
-    response.hangup();
-
     return response.toString();
   }
 
   throw new Error("Unknown call verdict.");
 }
-
 
 export function createTwilioClient() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -59,25 +46,14 @@ export function createTwilioClient() {
   return twilio(accountSid, authToken);
 }
 
-
 export async function applyCallVerdict(
   callSid: string,
   verdict: CallVerdict,
   protectedNumber?: string
 ): Promise<void> {
   const client = createTwilioClient();
-
-  // Generate instructions based on the verdict
-  const twiml = buildVerdictTwiml(
-    verdict,
-    protectedNumber
-  );
-
-  // Update the active Twilio call
-  const updatedCall = await client.calls(callSid).update({
-    twiml,
-  });
-
+  const twiml = buildVerdictTwiml(verdict, protectedNumber);
+  const updatedCall = await client.calls(callSid).update({ twiml });
   console.log("Call updated:", updatedCall.sid);
   console.log("Verdict applied:", verdict);
 }

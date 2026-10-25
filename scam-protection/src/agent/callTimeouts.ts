@@ -5,7 +5,7 @@ import {
 } from "./callSessions.js";
 
 // Maximum time allowed for a screening session
-export const SCREENING_TIMEOUT_MS = 60_000;
+export const SCREENING_TIMEOUT_MS = 150_000;
 
 // Store active timeout timers by Call SID
 const callTimers = new Map<

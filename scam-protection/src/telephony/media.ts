@@ -1,5 +1,5 @@
 
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import type { Server } from "http";
 import twilio from "twilio";
 
@@ -23,21 +23,29 @@ import {
 
 import {
   createScreeningSession,
+  askNextQuestion,
+  submitCallerResponse,
+  getScreeningVerdict,
   removeScreeningSession,
   getActiveScreeningCount,
 } from "../agent/screeningSession.js";
 
 import { applyCallVerdict } from "./callActions.js";
-
-// NEW: Twilio audio processor
 import { processTwilioAudio } from "./audioProcessor.js";
+import { generateSpeech } from "../agent/cartesiaTTS.js";
+import { sendAudioToTwilio } from "./sendAudio.js";
+import { CartesiaSTT } from "../agent/cartesiaSTT.js";
 
-export function setupMediaWebSocket(server: Server) {
-  const wss = new WebSocketServer({
-    noServer: true,
-  });
+type TurnState =
+  | "starting"
+  | "speaking"
+  | "listening"
+  | "processing"
+  | "finished";
 
-  // Step 1: Authenticate WebSocket upgrade requests
+export function setupMediaWebSocket(server: Server): void {
+  const wss = new WebSocketServer({ noServer: true });
+
   server.on("upgrade", (req, socket, head) => {
     if (req.url !== "/media") {
       socket.destroy();
@@ -53,17 +61,13 @@ export function setupMediaWebSocket(server: Server) {
       !mediaUrl ||
       typeof signature !== "string"
     ) {
-      console.log("WebSocket authentication missing");
-
       socket.write(
         "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
       );
-
       socket.destroy();
       return;
     }
 
-    // Validate Twilio's signature
     const urlsToCheck = [
       mediaUrl,
       mediaUrl.endsWith("/")
@@ -80,16 +84,12 @@ export function setupMediaWebSocket(server: Server) {
       )
     );
 
-    console.log(
-      "Media WebSocket signature valid:",
-      isValid
-    );
+    console.log("Media WebSocket signature valid:", isValid);
 
     if (!isValid) {
       socket.write(
         "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
       );
-
       socket.destroy();
       return;
     }
@@ -99,156 +99,171 @@ export function setupMediaWebSocket(server: Server) {
     });
   });
 
-  // Step 2: Handle authenticated WebSocket connections
   wss.on("connection", (ws) => {
     console.log("Media WebSocket connected");
 
     let callSid: string | null = null;
     let streamSid: string | null = null;
+
+    let stt: CartesiaSTT | null = null;
     let mediaChunkCount = 0;
 
-    // Only the connection that created a session owns it
     let sessionCreated = false;
-
-    // Track screening session ownership
     let screeningCreated = false;
-
-    // Prevent cleanup from happening twice
     let cleanedUp = false;
-
-    // Prevent multiple timeout actions
     let timedOut = false;
 
-    // Step 3: Normal session cleanup
-    function cleanupSession() {
-      if (cleanedUp) {
-        return;
-      }
+    let turnState: TurnState = "starting";
+    let questionNumber = 0;
+    let expectedPlaybackMark: string | null = null;
 
-      cleanedUp = true;
+    const speechController = new AbortController();
 
-      if (!callSid || !sessionCreated) {
-        return;
-      }
-
-      clearCallTimeout(callSid);
-
-      // Remove the screening session
-      if (screeningCreated) {
-        removeScreeningSession(callSid);
-        screeningCreated = false;
-
-        console.log(
-          "Screening session removed:",
-          callSid
-        );
-
-        console.log(
-          "Active screenings:",
-          getActiveScreeningCount()
-        );
-      }
-
-      // Remove the call session
-      const removed = removeCallSession(callSid);
-
-      if (removed) {
-        console.log(
-          "Call session removed:",
-          callSid
-        );
-
-        console.log(
-          "Active calls:",
-          getActiveCallCount()
-        );
-      }
-
-      sessionCreated = false;
-    }
-
-    // Step 4: Handle connection errors
-    function handleConnectionError(
-      errorType: CallErrorType,
-      error: unknown
-    ) {
-      if (cleanedUp) {
-        return;
-      }
-
-      if (!callSid || !sessionCreated) {
-        console.error(
-          "WebSocket error without owned session:",
-          error
-        );
-
-        cleanedUp = true;
-        ws.close();
-        return;
-      }
-
-      cleanedUp = true;
-
-      // Clean up screening resources
-      if (screeningCreated) {
-        removeScreeningSession(callSid);
-        screeningCreated = false;
-      }
-
-      const result = handleCallError(
-        callSid,
-        errorType,
-        error
-      );
-
-      sessionCreated = false;
-
-      console.log(
-        "Call error handled:",
-        result.errorType
-      );
-
-      ws.close();
-    }
-
-    // Step 5: Handle screening timeout
-    async function handleScreeningTimeout(
-      expiredCallSid: string
-    ) {
+    // Twilio playback marks are used to know
+    // when InterHoot has finished speaking.
+    async function speak(
+      text: string,
+      expectedCallSid: string,
+      expectedStreamSid: string
+    ): Promise<void> {
       if (
-        timedOut ||
         cleanedUp ||
-        !sessionCreated ||
-        callSid !== expiredCallSid
+        timedOut ||
+        turnState === "finished"
       ) {
         return;
       }
 
-      timedOut = true;
+      turnState = "speaking";
+      questionNumber++;
 
-      console.log(
-        "Screening timeout reached:",
-        expiredCallSid
-      );
+      const markName = `interhoot-question-${questionNumber}`;
+      expectedPlaybackMark = markName;
+
+      console.log("InterHoot asks:", text);
 
       try {
-        // Temporarily reject timed-out calls
-        // using the YELLOW verdict.
-        await applyCallVerdict(
-          expiredCallSid,
-          "YELLOW"
+        const audio = await generateSpeech(
+          text,
+          speechController.signal
+        );
+
+        if (
+          cleanedUp ||
+          timedOut ||
+          callSid !== expectedCallSid ||
+          streamSid !== expectedStreamSid ||
+          ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        // Existing sendAudioToTwilio() sends audio
+        // and its default playback marker.
+        sendAudioToTwilio(
+          ws,
+          expectedStreamSid,
+          audio
+        );
+
+        // Send our own unique marker after the audio.
+        ws.send(
+          JSON.stringify({
+            event: "mark",
+            streamSid: expectedStreamSid,
+            mark: {
+              name: markName,
+            },
+          })
         );
 
         console.log(
-          "Timed-out call disconnected:",
-          expiredCallSid
+          "InterHoot audio sent. Waiting for playback:",
+          markName
+        );
+      } catch (error) {
+        if (
+          cleanedUp ||
+          timedOut ||
+          speechController.signal.aborted
+        ) {
+          return;
+        }
+
+        console.error(
+          "Speech generation failed:",
+          error
         );
 
-        // Close the stream after call control succeeds.
-        ws.close();
+        handleConnectionError(
+          "WEBSOCKET_ERROR",
+          error
+        );
+      }
+    }
+
+    // Ask the next scripted screening question.
+    async function advanceConversation(
+      expectedCallSid: string,
+      expectedStreamSid: string
+    ): Promise<void> {
+      if (
+        cleanedUp ||
+        timedOut ||
+        !screeningCreated
+      ) {
+        return;
+      }
+
+      turnState = "processing";
+
+      try {
+        const nextLine = askNextQuestion(expectedCallSid);
+
+        if (
+          nextLine ===
+          "Thank you. I have enough information to review this call."
+        ) {
+          turnState = "finished";
+
+          const verdict = getScreeningVerdict(
+            expectedCallSid
+          );
+
+          console.log("Screening completed.");
+          console.log("Screening verdict:", verdict);
+
+          await applyCallVerdict(
+            expectedCallSid,
+            verdict
+          );
+
+          return;
+        }
+
+        if (
+          nextLine === "Waiting for caller response..." ||
+          nextLine === "The conversation is ready for a verdict."
+        ) {
+          console.log(
+            "Conversation cannot advance:",
+            nextLine
+          );
+          return;
+        }
+
+        await speak(
+          nextLine,
+          expectedCallSid,
+          expectedStreamSid
+        );
       } catch (error) {
+        if (cleanedUp || timedOut) {
+          return;
+        }
+
         console.error(
-          "Failed to disconnect timed-out call:",
+          "Conversation advancement failed:",
           error
         );
 
@@ -259,44 +274,175 @@ export function setupMediaWebSocket(server: Server) {
       }
     }
 
-    // Step 6: Handle Twilio messages
-    ws.on("message", (data) => {
-      if (cleanedUp) {
+    function cleanupSession(): void {
+      if (cleanedUp) return;
+
+      cleanedUp = true;
+      turnState = "finished";
+
+      speechController.abort();
+
+      stt?.close();
+      stt = null;
+
+      if (!callSid || !sessionCreated) return;
+
+      clearCallTimeout(callSid);
+
+      if (screeningCreated) {
+        removeScreeningSession(callSid);
+        screeningCreated = false;
+
+        console.log(
+          "Screening session removed:",
+          callSid
+        );
+      }
+
+      removeCallSession(callSid);
+      sessionCreated = false;
+
+      console.log(
+        "Active screenings:",
+        getActiveScreeningCount()
+      );
+
+      console.log(
+        "Active calls:",
+        getActiveCallCount()
+      );
+    }
+
+    function handleConnectionError(
+      errorType: CallErrorType,
+      error: unknown
+    ): void {
+      if (cleanedUp) return;
+
+      speechController.abort();
+
+      stt?.close();
+      stt = null;
+
+      if (!callSid || !sessionCreated) {
+        console.error(
+          "WebSocket error without session:",
+          error
+        );
+
+        cleanedUp = true;
+        ws.close();
         return;
       }
+
+      cleanedUp = true;
+      turnState = "finished";
+
+      clearCallTimeout(callSid);
+
+      if (screeningCreated) {
+        removeScreeningSession(callSid);
+        screeningCreated = false;
+      }
+
+      handleCallError(callSid, errorType, error);
+      sessionCreated = false;
+
+      ws.close();
+    }
+
+    // The 60-second deadline is never reset.
+    async function handleScreeningTimeout(
+      expiredCallSid: string
+    ): Promise<void> {
+      if (
+        timedOut ||
+        cleanedUp ||
+        !sessionCreated ||
+        callSid !== expiredCallSid
+      ) {
+        return;
+      }
+
+      timedOut = true;
+      turnState = "finished";
+
+      console.log(
+        "Hard 60-second screening timeout:",
+        expiredCallSid
+      );
+
+      // Cancel any ongoing speech generation.
+      speechController.abort();
+
+      stt?.close();
+      stt = null;
+
+      // Clear queued Twilio audio.
+      if (
+        streamSid &&
+        ws.readyState === WebSocket.OPEN
+      ) {
+        ws.send(
+          JSON.stringify({
+            event: "clear",
+            streamSid,
+          })
+        );
+      }
+
+      try {
+        // YELLOW is the existing timeout verdict.
+        await applyCallVerdict(
+          expiredCallSid,
+          "YELLOW"
+        );
+
+        console.log(
+          "Timed-out screening terminated:",
+          expiredCallSid
+        );
+
+        ws.close();
+      } catch (error) {
+        console.error(
+          "Timeout termination failed:",
+          error
+        );
+
+        handleConnectionError(
+          "CALL_CONTROL_ERROR",
+          error
+        );
+      }
+    }
+
+    ws.on("message", (data) => {
+      if (cleanedUp) return;
 
       try {
         const message = JSON.parse(data.toString());
 
         switch (message.event) {
-          case "connected":
+          case "connected": {
             console.log("Twilio stream connected");
             break;
+          }
 
           case "start": {
+            const newCallSid = message.start?.callSid;
+            const newStreamSid = message.start?.streamSid;
+
             if (
-              typeof message.start?.callSid !== "string" ||
-              !message.start.callSid ||
-              typeof message.start?.streamSid !== "string" ||
-              !message.start.streamSid
+              typeof newCallSid !== "string" ||
+              !newCallSid ||
+              typeof newStreamSid !== "string" ||
+              !newStreamSid ||
+              callSid !== null
             ) {
               handleConnectionError(
                 "WEBSOCKET_ERROR",
                 new Error("Invalid Twilio start event")
-              );
-              break;
-            }
-
-            const newCallSid: string =
-              message.start.callSid;
-
-            const newStreamSid: string =
-              message.start.streamSid;
-
-            if (callSid !== null) {
-              handleConnectionError(
-                "WEBSOCKET_ERROR",
-                new Error("Duplicate Twilio start event")
               );
               break;
             }
@@ -307,39 +453,25 @@ export function setupMediaWebSocket(server: Server) {
             console.log("Call SID:", callSid);
             console.log("Stream SID:", streamSid);
 
-            // Reject duplicate call sessions.
             if (getCallSession(newCallSid)) {
               console.error(
-                "Call session already exists:",
+                "Duplicate call session:",
                 newCallSid
               );
 
-              // Do not modify another connection's session.
               ws.close();
               break;
             }
 
-            // Create the call session
             createCallSession(newCallSid);
             sessionCreated = true;
 
-            console.log(
-              "Call session created:",
-              newCallSid
-            );
-
-            console.log(
-              "Active calls:",
-              getActiveCallCount()
-            );
-
-            // Create the screening session
             createScreeningSession(newCallSid);
             screeningCreated = true;
 
             console.log(
-              "Screening session created:",
-              newCallSid
+              "Active calls:",
+              getActiveCallCount()
             );
 
             console.log(
@@ -347,7 +479,6 @@ export function setupMediaWebSocket(server: Server) {
               getActiveScreeningCount()
             );
 
-            // Start the screening timeout
             startCallTimeout(
               newCallSid,
               SCREENING_TIMEOUT_MS,
@@ -359,21 +490,66 @@ export function setupMediaWebSocket(server: Server) {
             );
 
             console.log(
-              "Screening timeout started:",
+              "Screening deadline:",
               SCREENING_TIMEOUT_MS / 1000,
               "seconds"
+            );
+
+            stt = new CartesiaSTT(
+              newCallSid,
+              (completeResponse) => {
+                if (
+                  cleanedUp ||
+                  timedOut ||
+                  !screeningCreated ||
+                  turnState !== "listening"
+                ) {
+                  console.log(
+                    "STT response ignored:",
+                    completeResponse
+                  );
+                  return;
+                }
+
+                turnState = "processing";
+
+                console.log(
+                  "Caller response:",
+                  completeResponse
+                );
+
+                submitCallerResponse(
+                  newCallSid,
+                  completeResponse
+                );
+
+                console.log(
+                  "Caller response saved"
+                );
+
+                void advanceConversation(
+                  newCallSid,
+                  newStreamSid
+                );
+              }
+            );
+
+            stt.connect();
+
+            // Start with the scripted greeting.
+            void advanceConversation(
+              newCallSid,
+              newStreamSid
             );
 
             break;
           }
 
-          // NEW: Decode incoming Twilio audio
           case "media": {
-            // Only process audio for an active
-            // screening session owned by this connection.
             if (
               !sessionCreated ||
-              !screeningCreated
+              !screeningCreated ||
+              timedOut
             ) {
               break;
             }
@@ -385,25 +561,47 @@ export function setupMediaWebSocket(server: Server) {
 
             mediaChunkCount++;
 
-            // Log every 50 chunks
             if (mediaChunkCount % 50 === 0) {
               console.log(
                 "Audio chunks processed:",
                 mediaChunkCount
               );
-
-              console.log(
-                "Decoded audio bytes:",
-                audioBuffer.length
-              );
             }
 
-            // NEXT STEP:
-            // Stream audioBuffer to Cartesia STT.
+            // Forward audio only when listening.
+            if (turnState === "listening") {
+              stt?.sendAudio(audioBuffer);
+            }
+
             break;
           }
 
-          case "stop":
+          case "mark": {
+            const receivedMark = message.mark?.name;
+
+            if (
+              typeof receivedMark === "string" &&
+              receivedMark === expectedPlaybackMark &&
+              turnState === "speaking" &&
+              !timedOut
+            ) {
+              console.log(
+                "InterHoot playback completed:",
+                receivedMark
+              );
+
+              expectedPlaybackMark = null;
+              turnState = "listening";
+
+              console.log(
+                "InterHoot is now listening..."
+              );
+            }
+
+            break;
+          }
+
+          case "stop": {
             console.log("Twilio stream stopped");
 
             console.log(
@@ -413,12 +611,10 @@ export function setupMediaWebSocket(server: Server) {
 
             cleanupSession();
             break;
+          }
 
           default:
-            console.log(
-              "Unknown event:",
-              message.event
-            );
+            break;
         }
       } catch (error) {
         handleConnectionError(
@@ -428,14 +624,11 @@ export function setupMediaWebSocket(server: Server) {
       }
     });
 
-    // Step 7: Handle disconnections
     ws.on("close", () => {
       console.log("Media WebSocket disconnected");
-
       cleanupSession();
     });
 
-    // Step 8: Handle WebSocket errors
     ws.on("error", (error) => {
       handleConnectionError(
         "WEBSOCKET_ERROR",

@@ -1,122 +1,360 @@
 
 import "dotenv/config";
 import WebSocket from "ws";
+import { TranscriptAccumulator } from "./transcriptAccumulator.js";
 
-const apiKey = process.env.CARTESIA_API_KEY;
+type TranscriptEvent = {
+  type?: string;
+  text?: string;
+  transcript?: string;
+  is_final?: boolean;
+  final?: boolean;
+  language?: string;
+  language_code?: string;
+  [key: string]: unknown;
+};
 
-if (!apiKey) {
-  throw new Error("CARTESIA_API_KEY is missing from .env");
-}
+export class CartesiaSTT {
+  private ws: WebSocket | null = null;
 
-const url = new URL(
-  "wss://api.cartesia.ai/stt/websocket"
-);
+  private pending: Buffer[] = [];
+  private pendingBytes = 0;
 
-url.searchParams.set("model", "ink-2");
-url.searchParams.set("encoding", "pcm_mulaw");
-url.searchParams.set("sample_rate", "8000");
-url.searchParams.set("language", "en");
-url.searchParams.set("cartesia_version", "2026-03-01");
+  private readonly maxPendingBytes = 16_000;
 
-console.log("=== CARTESIA STT WEBSOCKET TEST ===");
-console.log("Connecting to Cartesia...");
+  private stopped = false;
 
-const ws = new WebSocket(url.toString(), {
-  headers: {
-    "X-API-Key": apiKey,
-  },
-  handshakeTimeout: 10000,
-});
+  private accumulator = new TranscriptAccumulator();
 
-let connected = false;
-let receivedError = false;
-let finished = false;
+  private hasPendingSpeech = false;
 
-const timeout = setTimeout(() => {
-  console.error("FAIL: Connection test timed out");
-  receivedError = true;
-  process.exitCode = 1;
-  ws.terminate();
-}, 15000);
+  private utteranceTimer: ReturnType<
+    typeof setTimeout
+  > | null = null;
 
-ws.on("open", () => {
-  connected = true;
+  // Wait 3 seconds after the last finalized
+  // transcript fragment before submitting.
+  private readonly utterancePauseMs = 3000;
 
-  console.log("PASS: WebSocket connection opened");
-  console.log("Model: ink-2");
-  console.log("Audio format: pcm_mulaw");
-  console.log("Sample rate: 8000 Hz");
+  constructor(
+    private readonly callSid: string,
+    private readonly onUtterance?: (
+      text: string
+    ) => void
+  ) {}
 
-  // Send the plain text command expected by Cartesia.
-  ws.send("close");
-});
+  connect(): void {
+    const apiKey = process.env.CARTESIA_API_KEY;
 
-ws.on("message", (data) => {
-  const message = data.toString();
-
-  console.log("Cartesia response:", message);
-
-  try {
-    const event = JSON.parse(message);
-
-    if (event.type === "error" || event.error_code) {
-      receivedError = true;
-      process.exitCode = 1;
+    if (!apiKey) {
+      console.error(
+        "Cartesia STT unavailable: CARTESIA_API_KEY is missing"
+      );
+      return;
     }
 
-    if (event.done === true && !receivedError) {
-      finished = true;
-      console.log("PASS: Cartesia acknowledged completion");
+    const url = new URL(
+      "wss://api.cartesia.ai/stt/websocket"
+    );
 
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close(1000);
+    url.searchParams.set("model", "ink-2");
+
+    url.searchParams.set(
+      "encoding",
+      "pcm_mulaw"
+    );
+
+    url.searchParams.set(
+      "sample_rate",
+      "8000"
+    );
+
+    // Keep English for this diagnostic test.
+    // We will change this only after verifying
+    // Cartesia's language detection behavior.
+    url.searchParams.set("language", "en");
+
+    url.searchParams.set(
+      "cartesia_version",
+      "2026-03-01"
+    );
+
+    const ws = new WebSocket(
+      url.toString(),
+      {
+        headers: {
+          "X-API-Key": apiKey,
+        },
       }
+    );
+
+    this.ws = ws;
+
+    ws.on("open", () => {
+      if (this.stopped) {
+        ws.close();
+        return;
+      }
+
+      console.log(
+        "Cartesia STT connected:",
+        this.callSid
+      );
+
+      // Send audio buffered while connecting.
+      for (const chunk of this.pending) {
+        ws.send(chunk, {
+          binary: true,
+        });
+      }
+
+      this.pending = [];
+      this.pendingBytes = 0;
+    });
+
+    ws.on("message", (raw) => {
+      if (this.stopped) {
+        return;
+      }
+
+      try {
+        const event = JSON.parse(
+          raw.toString()
+        ) as TranscriptEvent;
+
+        // NEW: Inspect the complete STT event.
+        // This helps us discover whether Cartesia
+        // provides language detection metadata.
+        console.log(
+          "Cartesia STT raw event:",
+          JSON.stringify(event, null, 2)
+        );
+
+        if (event.type === "error") {
+          console.error(
+            "Cartesia STT error event:",
+            event
+          );
+
+          return;
+        }
+
+        // Check whether language metadata exists.
+        if (
+          typeof event.language === "string"
+        ) {
+          console.log(
+            "Cartesia reported language:",
+            event.language
+          );
+        }
+
+        if (
+          typeof event.language_code === "string"
+        ) {
+          console.log(
+            "Cartesia reported language code:",
+            event.language_code
+          );
+        }
+
+        const text =
+          typeof event.text === "string"
+            ? event.text
+            : typeof event.transcript === "string"
+              ? event.transcript
+              : "";
+
+        const isFinal =
+          event.is_final === true ||
+          event.final === true ||
+          event.type === "final_transcript";
+
+        // Only process finalized transcript fragments.
+        if (!isFinal || !text.trim()) {
+          return;
+        }
+
+        this.accumulator.addFragment(text);
+
+        this.hasPendingSpeech = true;
+
+        console.log(
+          "STT fragment:",
+          text
+        );
+
+        // Reset the response pause timer.
+        if (
+          this.utteranceTimer !== null
+        ) {
+          clearTimeout(
+            this.utteranceTimer
+          );
+
+          this.utteranceTimer = null;
+        }
+
+        this.utteranceTimer = setTimeout(
+          () => {
+            this.utteranceTimer = null;
+
+            if (
+              !this.stopped &&
+              this.hasPendingSpeech
+            ) {
+              this.submitUtterance();
+            }
+          },
+          this.utterancePauseMs
+        );
+      } catch (error) {
+        console.error(
+          "Cartesia STT message processing error:",
+          error
+        );
+      }
+    });
+
+    ws.on("error", (error) => {
+      console.error(
+        "Cartesia STT WebSocket error:",
+        error.message
+      );
+    });
+
+    ws.on("close", (code, reason) => {
+      console.log(
+        "Cartesia STT disconnected:",
+        this.callSid,
+        code,
+        reason.toString()
+      );
+
+      this.clearUtteranceTimer();
+
+      this.pending = [];
+      this.pendingBytes = 0;
+
+      this.accumulator.clear();
+
+      this.hasPendingSpeech = false;
+    });
+  }
+
+  private submitUtterance(): void {
+    if (this.stopped) {
+      return;
     }
-  } catch {
-    // Non-JSON messages are logged above.
-  }
-});
 
-ws.on("unexpected-response", (_request, response) => {
-  receivedError = true;
-  process.exitCode = 1;
+    const text = this.accumulator.flush();
 
-  console.error(
-    "FAIL: HTTP handshake status:",
-    response.statusCode
-  );
+    this.hasPendingSpeech = false;
 
-  response.resume();
-  ws.terminate();
-});
+    if (!text) {
+      return;
+    }
 
-ws.on("error", (error) => {
-  receivedError = true;
-  process.exitCode = 1;
+    console.log(
+      "Complete caller response:",
+      text
+    );
 
-  console.error("FAIL: WebSocket error:", error.message);
-});
-
-ws.on("close", (code, reason) => {
-  clearTimeout(timeout);
-
-  console.log("WebSocket closed");
-  console.log("Close code:", code);
-
-  if (reason.length > 0) {
-    console.log("Close reason:", reason.toString());
+    try {
+      this.onUtterance?.(text);
+    } catch (error) {
+      console.error(
+        "Caller utterance callback failed:",
+        error
+      );
+    }
   }
 
-  if (
-    connected &&
-    !receivedError &&
-    code === 1000
-  ) {
-    console.log("PASS: Cartesia STT connection test completed");
-  } else if (connected && finished && !receivedError) {
-    console.log("PASS: Cartesia completed the test");
-  } else {
-    console.log("FAIL: STT connection test did not complete cleanly");
-    process.exitCode = 1;
+  private clearUtteranceTimer(): void {
+    if (
+      this.utteranceTimer !== null
+    ) {
+      clearTimeout(
+        this.utteranceTimer
+      );
+
+      this.utteranceTimer = null;
+    }
   }
-});
+
+  sendAudio(audio: Buffer): void {
+    if (
+      this.stopped ||
+      audio.length === 0
+    ) {
+      return;
+    }
+
+    if (
+      this.ws?.readyState === WebSocket.OPEN
+    ) {
+      this.ws.send(audio, {
+        binary: true,
+      });
+
+      return;
+    }
+
+    if (
+      this.ws?.readyState !== WebSocket.CONNECTING
+    ) {
+      return;
+    }
+
+    this.pending.push(audio);
+
+    this.pendingBytes += audio.length;
+
+    // Prevent unlimited buffering.
+    while (
+      this.pendingBytes >
+        this.maxPendingBytes &&
+      this.pending.length > 0
+    ) {
+      const dropped =
+        this.pending.shift()!;
+
+      this.pendingBytes -= dropped.length;
+    }
+  }
+
+  close(): void {
+    if (this.stopped) {
+      return;
+    }
+
+    this.stopped = true;
+
+    this.clearUtteranceTimer();
+
+    this.pending = [];
+    this.pendingBytes = 0;
+
+    this.accumulator.clear();
+
+    this.hasPendingSpeech = false;
+
+    const ws = this.ws;
+
+    if (!ws) {
+      return;
+    }
+
+    if (
+      ws.readyState === WebSocket.OPEN
+    ) {
+      ws.send("finalize");
+      ws.send("done");
+      ws.close();
+    } else if (
+      ws.readyState === WebSocket.CONNECTING
+    ) {
+      ws.terminate();
+    }
+  }
+}
