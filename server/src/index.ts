@@ -82,9 +82,9 @@ app.post("/precheck", async (req, res) => {
   res.json(await precheck(callSid, typeof from === "string" ? from : ""));
 });
 
-// When A's questions are done: { callSid, from, transcript: [{ role, text }], fallbackFlag?, forceFlag?, deferYellowNotify? }
+// When A's questions are done: { callSid, from, transcript: [{ role, text }], fallbackFlag?, forceFlag?, deferYellowNotify?, noGreen? }
 app.post("/screen-call", async (req, res) => {
-  const { callSid, from, transcript, fallbackFlag, forceFlag, startedAt, deferYellowNotify } = req.body ?? {};
+  const { callSid, from, transcript, fallbackFlag, forceFlag, startedAt, deferYellowNotify, noGreen } = req.body ?? {};
   if (typeof callSid !== "string" || !callSid || !Array.isArray(transcript)) {
     res.status(400).json({ error: "callSid and transcript are required" });
     return;
@@ -99,6 +99,7 @@ app.post("/screen-call", async (req, res) => {
         forceFlag: asFlag(forceFlag),
         startedAt: typeof startedAt === "number" ? startedAt : undefined,
         deferYellowNotify: deferYellowNotify === true,
+        noGreen: noGreen === true,
       }),
     );
   } catch (err) {

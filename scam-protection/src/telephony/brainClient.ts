@@ -100,6 +100,8 @@ export async function screenWithBrain(args: {
   startedAt: number;
   /** Set when A will take a message on a yellow call and then call sendCallMessage(). */
   deferYellowNotify?: boolean;
+  /** Gemini ended the questions early: never put the call through (green becomes yellow). */
+  noGreen?: boolean;
 }): Promise<ScreenResult | null> {
   return post<ScreenResult>(
     "/screen-call",
@@ -111,6 +113,7 @@ export async function screenWithBrain(args: {
       forceFlag: args.forceVerdict?.toLowerCase(),
       startedAt: args.startedAt,
       deferYellowNotify: args.deferYellowNotify === true,
+      noGreen: args.noGreen === true,
     },
     20_000,
   );

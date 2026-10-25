@@ -197,6 +197,8 @@ export interface ScreenCallInput {
   forceFlag?: Flag;
   /** A will take a message on a yellow call, so hold the push until addCallMessage(). */
   deferYellowNotify?: boolean;
+  /** Gemini ended the questions early, so the call is never put through: green becomes yellow. */
+  noGreen?: boolean;
 }
 
 export interface ScreenCallResult {
@@ -276,6 +278,10 @@ export async function screenCall(input: ScreenCallInput): Promise<ScreenCallResu
   if (!gemini) {
     flag = input.fallbackFlag ?? "yellow";
     reasons.unshift("The AI check was unavailable, so the basic screening rules decided.");
+  }
+  if (input.noGreen && flag === "green") {
+    flag = "yellow";
+    reasons.unshift("The screener ended the call early instead of putting it through.");
   }
   if (input.forceFlag) flag = input.forceFlag;
   const summary = turn.user_summary || reasons[0] || "Screened call.";

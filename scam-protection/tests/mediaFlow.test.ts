@@ -205,6 +205,30 @@ describe("simulated call through media.ts", () => {
     ws.close();
   });
 
+  it("Gemini ends the questions early: no more questions, never green, message taken", async () => {
+    mocks.language = "en";
+    mocks.turnReply = { nextAgentLine: "Thank you. Mr. Slavny will review his statements and call the bank directly.", callerLanguage: "en", scamProbability: 0.2 };
+    mocks.screenReply = { flag: "yellow", score: 0.2, reasons: [], summary: "s", forwardTo: null, messagePending: true };
+
+    const { ws, hearNextLine } = await startCall("CA4");
+    await hearNextLine();
+    mocks.stts[0].onUtterance("Hi, this is the bank. Your monthly statement is ready.");
+
+    // The next line is the message prompt, not Gemini's closing line or another question.
+    await hearNextLine();
+    expect(mocks.turns).toHaveLength(1);
+    expect(mocks.screenArgs[0].noGreen).toBe(true);
+    expect(mocks.screenArgs[0].fallbackVerdict).toBe("YELLOW");
+    expect(mocks.speech.map((s) => s.text)).not.toContain(mocks.turnReply.nextAgentLine);
+    expect(mocks.stts).toHaveLength(2);
+    mocks.stts[1].onUtterance("Please call us back.");
+
+    await until(() => mocks.verdicts.length === 1, "the verdict");
+    expect(mocks.messages).toEqual([{ callSid: "CA4", message: "Please call us back." }]);
+    expect(mocks.verdicts[0].verdict).toBe("YELLOW");
+    ws.close();
+  });
+
   it("caller hangs up while leaving a message: the message call still goes out", async () => {
     mocks.language = "en";
     mocks.turnReply = { nextAgentLine: "Which account is this about?", callerLanguage: "en", scamProbability: 0.6 };

@@ -33,7 +33,7 @@ import {
   getFollowUpState,
 } from "../agent/screeningSession.js";
 
-import type { NextLineOptions } from "../agent/conversation.js";
+import type { CallVerdict, NextLineOptions } from "../agent/conversation.js";
 
 import {
   baseLanguage,
@@ -60,6 +60,9 @@ import {
 
 // How long a yellow caller gets to leave a message after the prompt starts.
 const MESSAGE_LISTEN_MS = 30_000;
+
+// Question marks in the scripts Gemini writes in (Latin, CJK full-width, Arabic).
+const QUESTION_MARK = /[?？؟]/;
 
 type TurnState =
   | "starting"
@@ -477,10 +480,12 @@ export function setupMediaWebSocket(server: Server): void {
 
     // A5: Gemini writes the follow-up questions. Without a usable line
     // (slow, down, or a language TTS can't speak), A's fixed question is used.
+    // A line with no question mark means Gemini wants to stop screening and
+    // not put the call through (closing), which ends the call as yellow.
     async function chooseFollowUp(
       expectedCallSid: string,
       followUpsAsked: number
-    ): Promise<{ options: NextLineOptions; language: string }> {
+    ): Promise<{ options: NextLineOptions; language: string; closing: boolean }> {
       const turn = await nextTurn({
         callSid: expectedCallSid,
         transcript: getScreeningTranscript(expectedCallSid),
@@ -493,17 +498,103 @@ export function setupMediaWebSocket(server: Server): void {
 
       const fixedLanguage = callerLanguage ?? "en";
 
-      if (turn?.nextAgentLine.trim() && TTS_LANGUAGES.has(spoken)) {
+      const line = turn?.nextAgentLine.trim() ?? "";
+
+      if (line && !QUESTION_MARK.test(line)) {
+        console.log("Gemini ended screening early:", line);
+
         return {
-          options: { followUp: turn.nextAgentLine, language: fixedLanguage },
+          options: { language: fixedLanguage },
+          language: fixedLanguage,
+          closing: true,
+        };
+      }
+
+      if (line && TTS_LANGUAGES.has(spoken)) {
+        return {
+          options: { followUp: line, language: fixedLanguage },
           language: spoken,
+          closing: false,
         };
       }
 
       return {
         options: { language: fixedLanguage },
         language: fixedLanguage,
+        closing: false,
       };
+    }
+
+    // End the questions and act on the verdict. B's scoring decides; A's
+    // rule-based verdict is the fallback. endedEarly (Gemini stopped the
+    // questions) means the call is never put through: green becomes yellow.
+    async function finishScreening(
+      expectedCallSid: string,
+      expectedStreamSid: string,
+      endedEarly = false
+    ): Promise<void> {
+      const verdict: CallVerdict = endedEarly
+        ? "YELLOW"
+        : getScreeningVerdict(expectedCallSid);
+
+      console.log("Screening completed.", endedEarly ? "(ended early by Gemini)" : "");
+      console.log("Screening verdict:", verdict);
+
+      verdictSubmitted = true;
+      turnState = "finished";
+      expectedPlaybackMark = null;
+
+      speechController.abort();
+
+      stt?.close();
+      stt = null;
+
+      clearPlayback();
+
+      // B's scoring (Gemini + CRS + history) makes the final call and logs it to the app.
+      // A's rule-based verdict above is the fallback if the brain is unavailable.
+      const brain = await screenWithBrain({
+        callSid: expectedCallSid,
+        from: callerFrom,
+        transcript: getScreeningTranscript(expectedCallSid),
+        fallbackVerdict: verdict,
+        startedAt: callStartedAt,
+        deferYellowNotify: true,
+        noGreen: endedEarly,
+      });
+      const finalVerdict = brain ? toCallVerdict(brain.flag) : verdict;
+
+      console.log("Brain verdict:", brain ? `${brain.flag} (${brain.score})` : "unavailable");
+
+      // YELLOW: take a message first. The brain sends the push with it.
+      if (finalVerdict === "YELLOW" && brain?.messagePending) {
+        const message = cleanedUp
+          ? ""
+          : await takeMessage(expectedCallSid, expectedStreamSid);
+
+        const sent = await sendCallMessage(expectedCallSid, message);
+
+        console.log(
+          "Caller message:",
+          message ? `"${message}"` : "(none)",
+          sent ? "saved" : "not saved"
+        );
+      }
+
+      // GREEN automatically forwards to the protected number.
+      // YELLOW and RED end the call.
+      await applyCallVerdict(
+        expectedCallSid,
+        finalVerdict,
+        brain?.forwardTo || process.env.PROTECTED_PHONE_NUMBER
+      );
+
+      clearCallTimeout(expectedCallSid);
+
+      console.log(
+        "Final call action applied:",
+        finalVerdict
+      );
     }
 
     // A7: read the user's language, then start STT and the greeting.
@@ -609,6 +700,12 @@ export function setupMediaWebSocket(server: Server): void {
 
           if (cleanedUp || timedOut || verdictSubmitted) return;
 
+          // Gemini doesn't want the call put through: yellow, take a message.
+          if (choice.closing) {
+            await finishScreening(expectedCallSid, expectedStreamSid, true);
+            return;
+          }
+
           options = choice.options;
           lineLanguage = choice.language;
         }
@@ -623,68 +720,7 @@ export function setupMediaWebSocket(server: Server): void {
           nextLine ===
           "Thank you. I have enough information to review this call."
         ) {
-          const verdict = getScreeningVerdict(
-            expectedCallSid
-          );
-
-          console.log("Screening completed.");
-          console.log("Screening verdict:", verdict);
-
-          verdictSubmitted = true;
-          turnState = "finished";
-          expectedPlaybackMark = null;
-
-          speechController.abort();
-
-          stt?.close();
-          stt = null;
-
-          clearPlayback();
-
-          // B's scoring (Gemini + CRS + history) makes the final call and logs it to the app.
-          // A's rule-based verdict above is the fallback if the brain is unavailable.
-          const brain = await screenWithBrain({
-            callSid: expectedCallSid,
-            from: callerFrom,
-            transcript: getScreeningTranscript(expectedCallSid),
-            fallbackVerdict: verdict,
-            startedAt: callStartedAt,
-            deferYellowNotify: true,
-          });
-          const finalVerdict = brain ? toCallVerdict(brain.flag) : verdict;
-
-          console.log("Brain verdict:", brain ? `${brain.flag} (${brain.score})` : "unavailable");
-
-          // YELLOW: take a message first. The brain sends the push with it.
-          if (finalVerdict === "YELLOW" && brain?.messagePending) {
-            const message = cleanedUp
-              ? ""
-              : await takeMessage(expectedCallSid, expectedStreamSid);
-
-            const sent = await sendCallMessage(expectedCallSid, message);
-
-            console.log(
-              "Caller message:",
-              message ? `"${message}"` : "(none)",
-              sent ? "saved" : "not saved"
-            );
-          }
-
-          // GREEN automatically forwards to the protected number.
-          // YELLOW and RED end the call.
-          await applyCallVerdict(
-            expectedCallSid,
-            finalVerdict,
-            brain?.forwardTo || process.env.PROTECTED_PHONE_NUMBER
-          );
-
-          clearCallTimeout(expectedCallSid);
-
-          console.log(
-            "Final call action applied:",
-            finalVerdict
-          );
-
+          await finishScreening(expectedCallSid, expectedStreamSid);
           return;
         }
 
