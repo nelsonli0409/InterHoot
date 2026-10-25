@@ -1,21 +1,17 @@
-//
-//  ContentView.swift
-//  interhoot
-//
-//  Created by Alexander Slavny on 10/24/26.
-//
-
 import SwiftUI
 
 struct ContentView: View {
+    @State private var store = FeedStore()
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        TabView {
+            FeedView()
+                .tabItem { Label("Calls", systemImage: "phone") }
+            BlockedView()
+                .tabItem { Label("Blocked", systemImage: "hand.raised") }
         }
-        .padding()
+        .environment(store)
+        .task { store.start() }
     }
 }
 
