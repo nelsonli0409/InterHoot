@@ -45,6 +45,7 @@ final class FeedStore {
             return
         }
         await syncCallBlocking()
+        await PushRegistrar.shared.register()
     }
 
     /// C5: keep the iPhone's block list in step with flagged_number. `force` reloads even if nothing changed.

@@ -51,6 +51,7 @@ struct BlockedView: View {
                     } else {
                         Text("iPhone block list: not loaded yet")
                     }
+                    Text(PushRegistrar.shared.status)
                     Button("Sync now") {
                         Task { await store.syncCallBlocking(force: true) }
                     }
