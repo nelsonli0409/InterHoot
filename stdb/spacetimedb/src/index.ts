@@ -150,6 +150,12 @@ export const register_apns_token = spacetimedb.reducer(
   }
 );
 
+// Empties the blocked-number list (test cleanup). Leaves call_log and protected_user alone.
+export const clear_flagged_numbers = spacetimedb.reducer({}, (ctx) => {
+  const rows = Array.from(ctx.db.flaggedNumber.iter());
+  for (const row of rows) ctx.db.flaggedNumber.delete(row);
+});
+
 // The "Not a scam" button: the number stays on record but goes green, so it is no longer blocked.
 export const mark_false_positive = spacetimedb.reducer(
   { e164: t.string() },
