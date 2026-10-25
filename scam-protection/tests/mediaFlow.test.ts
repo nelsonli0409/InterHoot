@@ -205,7 +205,7 @@ describe("simulated call through media.ts", () => {
     ws.close();
   });
 
-  it("Gemini ends the questions early: no more questions, never green, message taken", async () => {
+  it("Gemini ends the questions early: no more questions, the score decides (yellow here), message taken", async () => {
     mocks.language = "en";
     mocks.turnReply = { nextAgentLine: "Thank you. Mr. Slavny will review his statements and call the bank directly.", callerLanguage: "en", scamProbability: 0.2 };
     mocks.screenReply = { flag: "yellow", score: 0.2, reasons: [], summary: "s", forwardTo: null, messagePending: true };
@@ -217,7 +217,7 @@ describe("simulated call through media.ts", () => {
     // The next line is the message prompt, not Gemini's closing line or another question.
     await hearNextLine();
     expect(mocks.turns).toHaveLength(1);
-    expect(mocks.screenArgs[0].noGreen).toBe(true);
+    expect(mocks.screenArgs[0].noGreen).toBeUndefined();
     expect(mocks.screenArgs[0].fallbackVerdict).toBe("YELLOW");
     expect(mocks.speech.map((s) => s.text)).not.toContain(mocks.turnReply.nextAgentLine);
     expect(mocks.stts).toHaveLength(2);

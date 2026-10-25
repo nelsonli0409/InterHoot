@@ -480,8 +480,8 @@ export function setupMediaWebSocket(server: Server): void {
 
     // A5: Gemini writes the follow-up questions. Without a usable line
     // (slow, down, or a language TTS can't speak), A's fixed question is used.
-    // A line with no question mark means Gemini wants to stop screening and
-    // not put the call through (closing), which ends the call as yellow.
+    // A line with no question mark is Gemini's closing line: it has enough,
+    // so the questions end and the score decides the call.
     async function chooseFollowUp(
       expectedCallSid: string,
       followUpsAsked: number
@@ -526,8 +526,9 @@ export function setupMediaWebSocket(server: Server): void {
     }
 
     // End the questions and act on the verdict. B's scoring decides; A's
-    // rule-based verdict is the fallback. endedEarly (Gemini stopped the
-    // questions) means the call is never put through: green becomes yellow.
+    // rule-based verdict is the fallback. endedEarly: Gemini had enough and
+    // stopped the questions (its closing line isn't spoken); the score still
+    // decides, and yellow if the brain is down.
     async function finishScreening(
       expectedCallSid: string,
       expectedStreamSid: string,
@@ -560,7 +561,6 @@ export function setupMediaWebSocket(server: Server): void {
         fallbackVerdict: verdict,
         startedAt: callStartedAt,
         deferYellowNotify: true,
-        noGreen: endedEarly,
       });
       const finalVerdict = brain ? toCallVerdict(brain.flag) : verdict;
 
@@ -700,7 +700,7 @@ export function setupMediaWebSocket(server: Server): void {
 
           if (cleanedUp || timedOut || verdictSubmitted) return;
 
-          // Gemini doesn't want the call put through: yellow, take a message.
+          // Gemini has enough: skip the remaining questions, go to the verdict.
           if (choice.closing) {
             await finishScreening(expectedCallSid, expectedStreamSid, true);
             return;
