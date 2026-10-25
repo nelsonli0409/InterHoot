@@ -70,6 +70,15 @@ export async function logFullCall(row: FullCallLog): Promise<void> {
   ]);
 }
 
+/** The protected user's settings from onboarding, or null if the row doesn't exist. */
+export async function getProtectedUser(userId: string): Promise<{ language: string; realPhoneE164: string } | null> {
+  if (!SAFE_ID.test(userId)) return null;
+  const rows = await sql(`SELECT language, real_phone_e164 FROM protected_user WHERE id = '${userId}'`);
+  const row = rows[0];
+  if (!row) return null;
+  return { language: String(row.language ?? ""), realPhoneE164: String(row.real_phone_e_164 ?? row.real_phone_e164 ?? "") };
+}
+
 export class SpacetimeStore implements Store {
   async getPersonaPhone(realE164: string): Promise<string | null> {
     if (!E164.test(realE164)) return null;

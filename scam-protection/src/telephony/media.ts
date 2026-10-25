@@ -26,6 +26,7 @@ import {
   askNextQuestion,
   submitCallerResponse,
   getScreeningVerdict,
+  getScreeningTranscript,
   removeScreeningSession,
   getActiveScreeningCount,
 } from "../agent/screeningSession.js";
@@ -35,6 +36,7 @@ import { processTwilioAudio } from "./audioProcessor.js";
 import { generateSpeech } from "../agent/cartesiaTTS.js";
 import { sendAudioToTwilio } from "./sendAudio.js";
 import { CartesiaSTT } from "../agent/cartesiaSTT.js";
+import { screenWithBrain, toCallVerdict } from "./brainClient.js";
 
 type TurnState =
   | "starting"
@@ -98,6 +100,9 @@ export function setupMediaWebSocket(server: Server): void {
     let callSid: string | null = null;
     let streamSid: string | null = null;
     let stt: CartesiaSTT | null = null;
+    // Caller's number, passed by /twilio/voice as a <Parameter>.
+    let callerFrom = "";
+    const callStartedAt = Date.now();
 
     let mediaChunkCount = 0;
     let sessionCreated = false;
@@ -231,6 +236,16 @@ export function setupMediaWebSocket(server: Server): void {
       stt = null;
 
       clearPlayback();
+
+      // Log the timed-out call as yellow (copy the transcript before cleanup removes it).
+      void screenWithBrain({
+        callSid: expiredCallSid,
+        from: callerFrom,
+        transcript: getScreeningTranscript(expiredCallSid),
+        fallbackVerdict: "YELLOW",
+        forceVerdict: "YELLOW",
+        startedAt: callStartedAt,
+      });
 
       try {
         await applyCallVerdict(
@@ -378,19 +393,32 @@ export function setupMediaWebSocket(server: Server): void {
 
           clearPlayback();
 
+          // B's scoring (Gemini + CRS + history) makes the final call and logs it to the app.
+          // A's rule-based verdict above is the fallback if the brain is unavailable.
+          const brain = await screenWithBrain({
+            callSid: expectedCallSid,
+            from: callerFrom,
+            transcript: getScreeningTranscript(expectedCallSid),
+            fallbackVerdict: verdict,
+            startedAt: callStartedAt,
+          });
+          const finalVerdict = brain ? toCallVerdict(brain.flag) : verdict;
+
+          console.log("Brain verdict:", brain ? `${brain.flag} (${brain.score})` : "unavailable");
+
           // GREEN automatically forwards to the protected number.
           // YELLOW and RED end the call.
           await applyCallVerdict(
             expectedCallSid,
-            verdict,
-            process.env.PROTECTED_PHONE_NUMBER
+            finalVerdict,
+            brain?.forwardTo || process.env.PROTECTED_PHONE_NUMBER
           );
 
           clearCallTimeout(expectedCallSid);
 
           console.log(
             "Final call action applied:",
-            verdict
+            finalVerdict
           );
 
           return;
@@ -477,6 +505,9 @@ export function setupMediaWebSocket(server: Server): void {
 
             callSid = newCallSid;
             streamSid = newStreamSid;
+
+            const fromParameter = message.start?.customParameters?.from;
+            callerFrom = typeof fromParameter === "string" ? fromParameter : "";
 
             console.log(
               "Call SID:",
