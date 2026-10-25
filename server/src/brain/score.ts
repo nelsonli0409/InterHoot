@@ -18,9 +18,21 @@ import { detectRisks, SEVERITY_VALUE } from "./phraseRules.js";
 import type { Flag, GeminiTurn, PressureTactic, Verdict } from "./types.js";
 import type { VerifyResult } from "./verify.js";
 
-export const WEIGHTS = { gemini: 0.4, crs: 0.25, fraudFinder: 0.15, reverseLookup: 0.1, pattern: 0.1 } as const;
+export const WEIGHTS = { gemini: 0.5, crs: 0.25, fraudFinder: 0.1, reverseLookup: 0.05, pattern: 0.1 } as const;
 export const RED_THRESHOLD = 0.7;
 export const YELLOW_THRESHOLD = 0.35;
+
+/** Same keys as WEIGHTS. scoreCall accepts overrides so scripts/harness.ts can tune without editing this file. */
+export type Weights = { -readonly [K in keyof typeof WEIGHTS]: number };
+
+export interface ScoreOptions {
+  store?: Store;
+  embed?: Embedder;
+  now?: number;
+  weights?: Partial<Weights>;
+  redThreshold?: number;
+  yellowThreshold?: number;
+}
 
 const PAYMENT_PRESSURE: PressureTactic[] = ["gift_card", "wire", "crypto"];
 const VELOCITY_WINDOW_MS = Number(process.env.VELOCITY_WINDOW_HOURS ?? 24) * 3_600_000;
@@ -121,11 +133,14 @@ const round = (n: number) => Math.round(n * 1000) / 1000;
 /** Call once per phone call, at the end (each call may make one embedding request). */
 export async function scoreCall(
   input: ScoreInput,
-  opts: { store?: Store; embed?: Embedder; now?: number } = {},
+  opts: ScoreOptions = {},
 ): Promise<ScoreResult> {
   const store = opts.store ?? getStore();
   const embed = opts.embed ?? geminiEmbed;
   const now = opts.now ?? Date.now();
+  const w: Weights = { ...WEIGHTS, ...opts.weights };
+  const redAt = opts.redThreshold ?? RED_THRESHOLD;
+  const yellowAt = opts.yellowThreshold ?? YELLOW_THRESHOLD;
   const reasons: string[] = [];
   const { gemini, verify } = input;
 
@@ -166,11 +181,11 @@ export async function scoreCall(
   );
 
   const parts = {
-    gemini: WEIGHTS.gemini * gemini.scam_probability,
-    crs: WEIGHTS.crs * (verify.crs_contradiction ? 1 : 0),
-    fraudFinder: WEIGHTS.fraudFinder * (Math.min(100, Math.max(0, input.fraudFinderScore ?? 0)) / 100),
-    reverseLookup: WEIGHTS.reverseLookup * (input.reverseLookupMismatch ? 1 : 0),
-    pattern: WEIGHTS.pattern * patternSlot,
+    gemini: w.gemini * gemini.scam_probability,
+    crs: w.crs * (verify.crs_contradiction ? 1 : 0),
+    fraudFinder: w.fraudFinder * (Math.min(100, Math.max(0, input.fraudFinderScore ?? 0)) / 100),
+    reverseLookup: w.reverseLookup * (input.reverseLookupMismatch ? 1 : 0),
+    pattern: w.pattern * patternSlot,
   };
   const score = round(parts.gemini + parts.crs + parts.fraudFinder + parts.reverseLookup + parts.pattern);
 
@@ -179,8 +194,8 @@ export async function scoreCall(
 
   let flag: Flag;
   if (allowListed) flag = "green";
-  else if (exactRedRepeat || score >= RED_THRESHOLD || (verify.crs_contradiction && paymentPressure)) flag = "red";
-  else if (score >= YELLOW_THRESHOLD) flag = "yellow";
+  else if (exactRedRepeat || score >= redAt || (verify.crs_contradiction && paymentPressure)) flag = "red";
+  else if (score >= yellowAt) flag = "yellow";
   else flag = "green";
 
   // reasons[]: plain English, most important first. The app shows these.

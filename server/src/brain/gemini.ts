@@ -3,13 +3,15 @@
 //
 // Env:
 //   GEMINI_API_KEY   required
-//   GEMINI_MODEL     gemini-3.8-flash (default) or gemini-3.5-flash-lite — switch without code changes
+//   GEMINI_MODEL     gemini-3.5-flash-lite (default; 3.8-flash timed out in the B7 harness) or gemini-3.8-flash
+//   GEMINI_TIMEOUT_MS  per-request timeout, default 8000 (scripts/harness.ts raises it to measure latency)
 
 import type { GeminiTurn, TranscriptTurn } from "./types.js";
 
 const INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
-const DEFAULT_MODEL = "gemini-3.8-flash";
-const TIMEOUT_MS = 8_000; // the caller is waiting on the line; fail fast
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+// The caller is waiting on the line, so fail fast. Read per request so the harness can override it.
+const timeoutMs = () => Number(process.env.GEMINI_TIMEOUT_MS) || 8_000;
 const MAX_AGENT_LINE_CHARS = 220; // Cartesia bills TTS per character, and short turns sound natural
 
 /** The section 6 schema as JSON Schema. Keep in sync with GeminiTurn in types.ts. */
@@ -186,7 +188,7 @@ async function postOnce(body: unknown, apiKey: string): Promise<Response> {
       "Api-Revision": "2026-05-20", // pin the response schema (steps[], polymorphic response_format)
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs()),
   });
 }
 
