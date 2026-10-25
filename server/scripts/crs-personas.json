@@ -1,18 +1,67 @@
 {
   "_comment": "Copy to crs-personas.json and paste the bodies from the CRS MCP get_test_data tool. Persona data only — never real people. tuBody = TransUnion request body; fraudFinderBody = the persona's full Fraud Finder body. Phones default to 55501010NN if omitted.",
   "P20": {
-    "tuBody": { "_paste": "P20 DOLORES WHITCOMB TransUnion request body from get_test_data" }
+    "tuBody": {
+      "firstName": "DOLORES",
+      "lastName": "WHITCOMB",
+      "ssn": "666701020",
+      "addresses": [
+        {
+          "addressLine1": "612 OCEAN VIEW DR",
+          "city": "SANTA BARBARA",
+          "state": "CA",
+          "postalCode": "93109",
+          "borrowerResidencyType": "Current"
+        }
+      ]
+    }
   },
   "P13": {
     "phone": "5550101013",
-    "fraudFinderBody": { "_paste": "P13 KAYLA BRENNAN Fraud Finder body from get_test_data" }
+    "fraudFinderBody": {
+      "firstName": "KAYLA",
+      "lastName": "BRENNAN",
+      "phoneNumber": "5550101013",
+      "email": "kb.9921x@example.com",
+      "ipAddress": "198.51.100.13",
+      "address": {
+        "addressLine1": "9021 KINGSTON PIKE",
+        "city": "KNOXVILLE",
+        "state": "TN",
+        "postalCode": "37923"
+      }
+    }
   },
   "P12": {
     "phone": "5550101012",
-    "fraudFinderBody": { "_paste": "P12 Fraud Finder body from get_test_data" }
+    "fraudFinderBody": {
+      "firstName": "VICTOR",
+      "lastName": "ANAND",
+      "phoneNumber": "5550101012",
+      "email": "v.anand.1968@example.com",
+      "ipAddress": "198.51.100.12",
+      "address": {
+        "addressLine1": "55 WATER ST FL 20",
+        "city": "NEW YORK",
+        "state": "NY",
+        "postalCode": "10041"
+      }
+    }
   },
   "P01": {
     "phone": "5550101001",
-    "fraudFinderBody": { "_paste": "P01 Fraud Finder body from get_test_data" }
+    "fraudFinderBody": {
+      "firstName": "MARGARET",
+      "lastName": "OKAFOR",
+      "phoneNumber": "5550101001",
+      "email": "margaret.okafor@example.com",
+      "ipAddress": "203.0.113.11",
+      "address": {
+        "addressLine1": "1420 WILLOW CREEK DR",
+        "city": "SAN JOSE",
+        "state": "CA",
+        "postalCode": "95125"
+      }
+    }
   }
 }

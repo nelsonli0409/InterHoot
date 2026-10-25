@@ -3,7 +3,7 @@
  * reverse lookup + Fraud Finder for P13 / P12 / P01, then a team report.
  *
  * Run from /server:
- *   npx tsx --env-file=.env scripts/crs-smoke.ts
+ *   npx tsx --env-file=../.env scripts/crs-smoke.ts
  *
  * Needs CRS_USERNAME / CRS_PASSWORD in .env, and scripts/crs-personas.json
  * (copy crs-personas.example.json and paste the bodies from the CRS MCP
