@@ -17,7 +17,7 @@ struct FeedView: View {
                         NavigationLink(value: call) {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack {
-                                    Text(call.callerE164).font(.headline)
+                                    Text(call.callerDisplay).font(.headline)
                                     Spacer()
                                     FlagBadge(flag: call.flag)
                                 }

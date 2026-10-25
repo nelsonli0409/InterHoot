@@ -17,7 +17,7 @@ struct CallDetailView: View {
                     Text("Score \(call.score, format: .number.precision(.fractionLength(2)))")
                         .foregroundStyle(.secondary)
                 }
-                LabeledContent("Caller", value: call.callerE164)
+                LabeledContent("Caller", value: call.callerDisplay)
                 LabeledContent("Type", value: call.scamType.replacingOccurrences(of: "_", with: " "))
                 if !call.summary.isEmpty { Text(call.summary) }
             }

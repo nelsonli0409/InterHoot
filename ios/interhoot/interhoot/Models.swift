@@ -32,6 +32,9 @@ struct CallRecord: Identifiable, Hashable {
     }
 
     var startedDate: Date? { ISO8601DateFormatter().date(from: startedAt) }
+
+    /// "anonymous" is what the server stores for a call with no caller ID.
+    var callerDisplay: String { callerE164 == "anonymous" ? "No caller ID" : callerE164 }
 }
 
 struct FlaggedNumber: Identifiable, Hashable {

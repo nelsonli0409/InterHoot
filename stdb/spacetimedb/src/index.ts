@@ -69,6 +69,9 @@ export default spacetimedb;
 const FLAGS = ['green', 'yellow', 'red'];
 const SCAM_TYPES = ['none', 'irs_tax', 'debt_collection', 'bank_fraud', 'grandparent', 'tech_support', 'prize', 'other'];
 const E164 = /^\+[1-9]\d{6,14}$/;
+// Stored as caller_e164 for a call with no caller ID, so it still shows up in the app. Twilio's From for
+// withheld caller ID is "anonymous"; the server should send this exact word for any call it rejects as no-ID.
+const NO_CALLER_ID = 'anonymous';
 
 function requireFlag(flag: string) {
   if (!FLAGS.includes(flag)) throw new SenderError(`flag must be green, yellow or red, got "${flag}"`);
@@ -95,7 +98,7 @@ export const log_call = spacetimedb.reducer(
   },
   (ctx, row) => {
     requireFlag(row.flag);
-    requireE164(row.caller_e164);
+    if (row.caller_e164 !== NO_CALLER_ID) requireE164(row.caller_e164);
     if (!SCAM_TYPES.includes(row.scam_type)) throw new SenderError(`unknown scam_type "${row.scam_type}"`);
     if (row.score < 0 || row.score > 1) throw new SenderError('score must be between 0 and 1');
     if (ctx.db.callLog.id.find(row.id)) ctx.db.callLog.id.update(row);
