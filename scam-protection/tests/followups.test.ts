@@ -15,7 +15,7 @@ import {
   toScreeningLanguage,
 } from "../src/agent/screeningLanguages.js";
 
-import { chooseSttModel } from "../src/agent/cartesiaSTT.js";
+import { chooseSttModel, whisperUrl } from "../src/agent/cartesiaSTT.js";
 
 describe("Gemini follow-ups and languages", () => {
   it("greets in the user's language, then English", () => {
@@ -91,5 +91,11 @@ describe("Gemini follow-ups and languages", () => {
     process.env.CARTESIA_STT_MODEL = "ink-whisper";
     expect(chooseSttModel("es")).toBe("ink-whisper");
     delete process.env.CARTESIA_STT_MODEL;
+  });
+
+  it("tells ink-whisper which language to listen for", () => {
+    expect(new URL(whisperUrl("ru")).searchParams.get("language")).toBe("ru");
+    expect(new URL(whisperUrl("ko-KR")).searchParams.get("language")).toBe("ko");
+    expect(new URL(whisperUrl(undefined)).searchParams.get("language")).toBe("en");
   });
 });

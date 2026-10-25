@@ -21,11 +21,27 @@ const INK2_LANGUAGES = new Set(["en", "fr", "hi", "ja", "es"]);
 
 export type SttModel = "ink-2" | "ink-whisper";
 
+function baseLanguage(language?: string): string {
+  return (language ?? "").trim().split(/[-_]/)[0].toLowerCase();
+}
+
 export function chooseSttModel(language?: string): SttModel {
   const forced = process.env.CARTESIA_STT_MODEL?.trim();
   if (forced === "ink-2" || forced === "ink-whisper") return forced;
-  const base = (language ?? "").trim().split(/[-_]/)[0].toLowerCase();
-  return INK2_LANGUAGES.has(base) ? "ink-2" : "ink-whisper";
+  return INK2_LANGUAGES.has(baseLanguage(language)) ? "ink-2" : "ink-whisper";
+}
+
+// ink-whisper transcribes one language, set up front, and defaults to en
+// (docs.cartesia.ai/api-reference/stt/websocket), so pass the user's.
+/** The ink-whisper URL for a language (exported for tests). */
+export function whisperUrl(language?: string): string {
+  const url = new URL("wss://api.cartesia.ai/stt/websocket");
+  url.searchParams.set("model", "ink-whisper");
+  url.searchParams.set("encoding", "pcm_mulaw");
+  url.searchParams.set("sample_rate", "8000");
+  url.searchParams.set("language", baseLanguage(language) || "en");
+  url.searchParams.set("cartesia_version", "2026-03-01");
+  return url.toString();
 }
 
 export class CartesiaSTT {
@@ -33,6 +49,8 @@ export class CartesiaSTT {
 
   private model: SttModel;
   private fellBack = false;
+  // ISO 639-1 code ink-whisper listens for (it can't detect the language).
+  private readonly language: string;
 
   // Buffer audio while Cartesia connects.
   private pending: Buffer[] = [];
@@ -58,6 +76,7 @@ export class CartesiaSTT {
     options: { language?: string } = {}
   ) {
     this.model = chooseSttModel(options.language);
+    this.language = baseLanguage(options.language) || "en";
   }
 
   connect(): void {
@@ -209,24 +228,9 @@ export class CartesiaSTT {
   }
 
   private connectWhisper(apiKey: string): void {
-    const url = new URL(
-      "wss://api.cartesia.ai/stt/websocket"
-    );
+    const url = whisperUrl(this.language);
 
-    // Experiment with multilingual transcription.
-    url.searchParams.set("model", "ink-whisper");
-    url.searchParams.set("encoding", "pcm_mulaw");
-    url.searchParams.set("sample_rate", "8000");
-
-    // Intentionally omit the language parameter.
-    // We need to verify whether this endpoint
-    // accepts it and identifies languages.
-    url.searchParams.set(
-      "cartesia_version",
-      "2026-03-01"
-    );
-
-    const ws = new WebSocket(url.toString(), {
+    const ws = new WebSocket(url, {
       headers: {
         "X-API-Key": apiKey,
       },
