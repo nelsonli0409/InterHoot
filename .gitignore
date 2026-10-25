@@ -1,5 +1,6 @@
 # Secrets: never commit keys (Cartesia track rules: no API keys or secrets in the repo)
 .env
+env
 .env.*
 !.env.example
 .mcp.json
