@@ -1,11 +1,14 @@
 
 import "dotenv/config";
 import express from "express";
+import callsRouter from "./routes/calls.js";
 import { setupMediaWebSocket } from "./telephony/media.js";
 import twilioRouter from "./telephony/twilio.js";
 import { detectRisks } from "./riskDetector.js";
 
 const app = express();
+
+app.use("/calls", callsRouter);
 
 const PORT = Number(process.env.PORT) || 3000;
 

@@ -21,6 +21,12 @@ import {
   type CallErrorType,
 } from "../agent/callErrorHandler.js";
 
+import {
+  createScreeningSession,
+  removeScreeningSession,
+  getActiveScreeningCount,
+} from "../agent/screeningSession.js";
+
 import { applyCallVerdict } from "./callActions.js";
 
 export function setupMediaWebSocket(server: Server) {
@@ -54,7 +60,6 @@ export function setupMediaWebSocket(server: Server) {
       return;
     }
 
-    // Validate Twilio's signature
     const urlsToCheck = [
       mediaUrl,
       mediaUrl.endsWith("/")
@@ -71,7 +76,10 @@ export function setupMediaWebSocket(server: Server) {
       )
     );
 
-    console.log("Media WebSocket signature valid:", isValid);
+    console.log(
+      "Media WebSocket signature valid:",
+      isValid
+    );
 
     if (!isValid) {
       socket.write(
@@ -87,7 +95,7 @@ export function setupMediaWebSocket(server: Server) {
     });
   });
 
-  // Step 2: Handle authenticated WebSocket connections
+  // Step 2: Handle authenticated connections
   wss.on("connection", (ws) => {
     console.log("Media WebSocket connected");
 
@@ -95,16 +103,15 @@ export function setupMediaWebSocket(server: Server) {
     let streamSid: string | null = null;
     let mediaChunkCount = 0;
 
-    // Only the connection that created a session owns it
     let sessionCreated = false;
-
-    // Prevent cleanup from happening twice
     let cleanedUp = false;
-
-    // Prevent multiple timeout actions
     let timedOut = false;
 
-    // Step 3: Normal session cleanup
+    // NEW: Track whether this connection owns
+    // a screening session.
+    let screeningCreated = false;
+
+    // Step 3: Clean up all owned session resources
     function cleanupSession() {
       if (cleanedUp) {
         return;
@@ -118,10 +125,30 @@ export function setupMediaWebSocket(server: Server) {
 
       clearCallTimeout(callSid);
 
+      // NEW: Remove the screening session and transcript
+      if (screeningCreated) {
+        removeScreeningSession(callSid);
+        screeningCreated = false;
+
+        console.log(
+          "Screening session removed:",
+          callSid
+        );
+
+        console.log(
+          "Active screenings:",
+          getActiveScreeningCount()
+        );
+      }
+
       const removed = removeCallSession(callSid);
 
       if (removed) {
-        console.log("Call session removed:", callSid);
+        console.log(
+          "Call session removed:",
+          callSid
+        );
+
         console.log(
           "Active calls:",
           getActiveCallCount()
@@ -131,7 +158,7 @@ export function setupMediaWebSocket(server: Server) {
       sessionCreated = false;
     }
 
-    // Step 4: Handle errors for this connection
+    // Step 4: Handle connection errors
     function handleConnectionError(
       errorType: CallErrorType,
       error: unknown
@@ -140,7 +167,6 @@ export function setupMediaWebSocket(server: Server) {
         return;
       }
 
-      // Don't delete another connection's session
       if (!callSid || !sessionCreated) {
         console.error(
           "WebSocket error without owned session:",
@@ -152,8 +178,13 @@ export function setupMediaWebSocket(server: Server) {
         return;
       }
 
-      // Prevent duplicate cleanup
       cleanedUp = true;
+
+      // NEW: Clean up screening resources
+      if (screeningCreated) {
+        removeScreeningSession(callSid);
+        screeningCreated = false;
+      }
 
       const result = handleCallError(
         callSid,
@@ -168,8 +199,6 @@ export function setupMediaWebSocket(server: Server) {
         result.errorType
       );
 
-      // Close the media connection.
-      // This does not guarantee the Twilio call ends.
       ws.close();
     }
 
@@ -189,7 +218,6 @@ export function setupMediaWebSocket(server: Server) {
       );
 
       try {
-        // Temporarily use YELLOW for timeout rejection
         await applyCallVerdict(
           expiredCallSid,
           "YELLOW"
@@ -229,7 +257,9 @@ export function setupMediaWebSocket(server: Server) {
             ) {
               handleConnectionError(
                 "WEBSOCKET_ERROR",
-                new Error("Invalid Twilio start event")
+                new Error(
+                  "Invalid Twilio start event"
+                )
               );
               break;
             }
@@ -243,7 +273,9 @@ export function setupMediaWebSocket(server: Server) {
             if (callSid !== null) {
               handleConnectionError(
                 "WEBSOCKET_ERROR",
-                new Error("Duplicate Twilio start event")
+                new Error(
+                  "Duplicate Twilio start event"
+                )
               );
               break;
             }
@@ -268,6 +300,21 @@ export function setupMediaWebSocket(server: Server) {
                 getActiveCallCount()
               );
 
+              // NEW: Create the screening session
+              // and its associated transcript.
+              createScreeningSession(newCallSid);
+              screeningCreated = true;
+
+              console.log(
+                "Screening session created:",
+                newCallSid
+              );
+
+              console.log(
+                "Active screenings:",
+                getActiveScreeningCount()
+              );
+
               startCallTimeout(
                 newCallSid,
                 SCREENING_TIMEOUT_MS,
@@ -289,7 +336,6 @@ export function setupMediaWebSocket(server: Server) {
                 newCallSid
               );
 
-              // Do not modify another connection's session
               ws.close();
             }
 
@@ -316,6 +362,8 @@ export function setupMediaWebSocket(server: Server) {
               );
             }
 
+            // Audio processing will be connected
+            // to Cartesia STT in a later step.
             break;
 
           case "stop":
@@ -345,7 +393,10 @@ export function setupMediaWebSocket(server: Server) {
 
     // Step 7: Handle disconnections
     ws.on("close", () => {
-      console.log("Media WebSocket disconnected");
+      console.log(
+        "Media WebSocket disconnected"
+      );
+
       cleanupSession();
     });
 
