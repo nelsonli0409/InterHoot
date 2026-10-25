@@ -43,6 +43,12 @@ struct OnboardingView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    InterHootLogo(height: 110)
+                        .frame(maxWidth: .infinity)
+                }
+                .listRowBackground(Color.clear)
+
                 Section("Demo identity") {
                     Picker("Identity", selection: $identity) {
                         ForEach(DemoIdentity.all) { Text("\($0.displayName) (\($0.id))").tag($0) }

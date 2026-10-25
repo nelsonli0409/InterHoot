@@ -33,6 +33,9 @@ struct FeedView: View {
                 }
             }
             .navigationTitle("Calls")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { InterHootLogo(height: 24) }
+            }
             .navigationDestination(for: CallRecord.self) { CallDetailView(call: $0) }
             .refreshable { await store.refresh() }
         }

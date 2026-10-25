@@ -63,6 +63,9 @@ struct BlockedView: View {
                 .background(.bar)
             }
             .navigationTitle("Blocked")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { InterHootLogo(height: 24) }
+            }
             .refreshable { await store.refresh() }
         }
     }
