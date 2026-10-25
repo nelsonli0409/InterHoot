@@ -1,7 +1,7 @@
 // InterHoot SpacetimeDB module (build guide C1).
 // Tables mirror server/src/contract.ts. Ids and timestamps are strings, as in the contract;
-// callers pass timestamps as ISO 8601 strings. `.name(...)` keeps SQL column names as written
-// (SpacetimeDB would otherwise store e164 as e_164).
+// callers pass timestamps as ISO 8601 strings. SpacetimeDB stores `e164` columns as `e_164`;
+// SQL accepts both spellings, and the generated TypeScript bindings use camelCase accessors.
 import { schema, table, t, SenderError } from 'spacetimedb/server';
 
 const protectedUser = table(
@@ -11,7 +11,7 @@ const protectedUser = table(
     display_name: t.string(),
     language: t.string(),
     crs_persona_id: t.string(),
-    real_phone_e164: t.string().name('real_phone_e164'),
+    real_phone_e164: t.string(),
     apns_token: t.string(),
   }
 );
@@ -21,7 +21,7 @@ const callLog = table(
   {
     id: t.string().primaryKey(), // the Twilio CallSid, also the verdict's call_id
     user_id: t.string().index('btree'),
-    caller_e164: t.string().index('btree').name('caller_e164'),
+    caller_e164: t.string().index('btree'),
     started_at: t.string(),
     flag: t.string(),
     score: t.f64(),
@@ -36,7 +36,7 @@ const callLog = table(
 const flaggedNumber = table(
   { name: 'flagged_number', public: true },
   {
-    e164: t.string().primaryKey().name('e164'),
+    e164: t.string().primaryKey(),
     flag: t.string(),
     first_seen: t.string(),
     last_seen: t.string(),
@@ -58,7 +58,7 @@ const scamPattern = table(
 const demoCallerAlias = table(
   { name: 'demo_caller_alias', public: true },
   {
-    real_e164: t.string().primaryKey().name('real_e164'),
+    real_e164: t.string().primaryKey(),
     persona_phone: t.string(),
   }
 );
