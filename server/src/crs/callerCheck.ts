@@ -39,7 +39,27 @@ export async function checkCaller(
 ): Promise<CallerCheck> {
   const personaPhone = await aliasStore.getAlias(callerE164);
   if (!personaPhone) return { status: "skipped", reason: "no_alias" };
+  if (personaBodies !== callerBodies) return runChecks(personaPhone, personaBodies); // custom bodies: no cache
 
+  // Sandbox answers never change, so each persona is checked once per server run.
+  // Results with errors aren't kept, so a later call can try again.
+  let pending = callerCache.get(personaPhone);
+  if (!pending) {
+    pending = runChecks(personaPhone, personaBodies);
+    callerCache.set(personaPhone, pending);
+    pending.then(
+      (r) => {
+        if (r.status === "checked" && r.errors.length > 0) callerCache.delete(personaPhone);
+      },
+      () => callerCache.delete(personaPhone),
+    );
+  }
+  return pending;
+}
+
+const callerCache = new Map<string, Promise<CallerCheck>>();
+
+async function runChecks(personaPhone: string, personaBodies: Record<string, PersonaBody>): Promise<CallerCheck> {
   // Run both in parallel; one failing shouldn't sink the other.
   const body = personaBodies[personaPhone];
   const [rev, fraud] = await Promise.allSettled([

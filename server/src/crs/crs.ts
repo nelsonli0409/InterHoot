@@ -9,6 +9,34 @@
 // Response shapes below were confirmed against live sandbox calls in B1
 // (server/scripts/out/). Uses Node 20's built-in fetch. No new dependencies.
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Disk cache in server/scripts/out/ (gitignored, shared with scripts/crs-smoke.ts).
+// It survives `tsx watch` restarts, so saving a file never triggers a new CRS login
+// or credit pull. Same relative path from src/crs/ (tsx) and dist/crs/ (built).
+const CACHE_DIR = fileURLToPath(new URL("../../scripts/out/", import.meta.url));
+const TOKEN_FILE = join(CACHE_DIR, ".crs-token");
+const LOGIN_LOCK_FILE = join(CACHE_DIR, ".crs-login-locked");
+
+function readCache(file: string): string | null {
+  try {
+    return existsSync(file) ? readFileSync(file, "utf8") : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(file: string, data: string): void {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(file, data, { mode: 0o600 });
+  } catch (err) {
+    console.warn(`[crs] could not write cache ${file}: ${(err as Error).message}`);
+  }
+}
+
 const BASE_URL = (process.env.CRS_BASE_URL ?? "https://api-sandbox.stitchcredit.com/api").replace(/\/$/, "");
 const REQUEST_TIMEOUT_MS = 10_000;
 
@@ -111,9 +139,16 @@ export interface FraudFinderResult {
 // ---------------------------------------------------------------------------
 
 export class TokenManager {
-  private token: string | null = null;
+  // Reuse the last good token across restarts (a stale one costs one re-login on its first 401).
+  private token: string | null = readCache(TOKEN_FILE)?.trim() || null;
   private inFlight: Promise<string> | null = null; // shared by concurrent callers
-  private fatal: CrsError | null = null; // set once a login is rejected
+  // A rejected login is persisted to disk, so restarts can't keep retrying bad credentials.
+  private fatal: CrsError | null = existsSync(LOGIN_LOCK_FILE)
+    ? new CrsError(
+        `CRS logins are locked after a rejected login (${(readCache(LOGIN_LOCK_FILE) ?? "").trim()}). ` +
+          "Fix CRS_USERNAME / CRS_PASSWORD, delete server/scripts/out/.crs-login-locked, then restart.",
+      )
+    : null;
 
   constructor(
     private readonly username = process.env.CRS_USERNAME,
@@ -131,7 +166,10 @@ export class TokenManager {
    * one that failed, so parallel 401s trigger a single re-login) and logs in again.
    */
   async refresh(staleToken: string): Promise<string> {
-    if (this.token === staleToken) this.token = null;
+    if (this.token === staleToken) {
+      this.token = null;
+      writeCache(TOKEN_FILE, ""); // don't reload the dead token on the next restart
+    }
     return this.getToken();
   }
 
@@ -141,7 +179,7 @@ export class TokenManager {
 
     this.inFlight = (async () => {
       if (!this.username || !this.password) {
-        throw this.latch(new CrsError("CRS_USERNAME / CRS_PASSWORD are not set"));
+        throw this.latch(new CrsError("CRS_USERNAME / CRS_PASSWORD are not set"), false);
       }
 
       let res: Response;
@@ -161,7 +199,7 @@ export class TokenManager {
       if (!res.ok) {
         // The server rejected the login. Latch so nothing retries it in a loop.
         throw this.latch(
-          new CrsError(`CRS login rejected (HTTP ${res.status}); restart after fixing credentials`, res.status),
+          new CrsError(`CRS login rejected (HTTP ${res.status}); fix credentials, delete server/scripts/out/.crs-login-locked, then restart`, res.status),
         );
       }
 
@@ -169,6 +207,7 @@ export class TokenManager {
       if (!data?.token) throw this.latch(new CrsError("CRS login returned no token", res.status, data));
 
       this.token = data.token;
+      writeCache(TOKEN_FILE, data.token);
       return data.token;
     })().finally(() => {
       this.inFlight = null;
@@ -177,9 +216,11 @@ export class TokenManager {
     return this.inFlight;
   }
 
-  private latch(err: CrsError): CrsError {
+  /** Stop all further logins. persist=true also writes the lock to disk so restarts honor it. */
+  private latch(err: CrsError, persist = true): CrsError {
     this.fatal = err;
-    console.error(`[crs] ${err.message} — further logins disabled until restart`);
+    if (persist) writeCache(LOGIN_LOCK_FILE, `${new Date().toISOString()} ${err.message}\n`);
+    console.error(`[crs] ${err.message} — further logins disabled${persist ? " (lock saved to disk)" : " until restart"}`);
     return err;
   }
 }
@@ -285,6 +326,15 @@ export function getTradelines(userPersona: UserPersona): Promise<Tradeline[]> {
   const cached = tradelineCache.get(userPersona.id);
   if (cached) return cached;
 
+  // The sandbox file never changes, so a saved copy is as good as a fresh pull.
+  // Set CRS_REFRESH_TRADELINES=true to force one live pull (it then re-saves the copy).
+  const fromDisk = process.env.CRS_REFRESH_TRADELINES === "true" ? null : readTradelinesFromDisk(userPersona.id);
+  if (fromDisk) {
+    const ready = Promise.resolve(fromDisk);
+    tradelineCache.set(userPersona.id, ready);
+    return ready;
+  }
+
   const pending = pullTradelines(userPersona);
   tradelineCache.set(userPersona.id, pending);
   // Don't cache a failure forever; a later call can try again.
@@ -300,6 +350,28 @@ export async function preloadTradelines(userPersona: UserPersona): Promise<void>
   } catch (err) {
     console.error(`[crs] tradeline preload failed for ${userPersona.id}:`, (err as Error).message);
   }
+}
+
+const tradelineFile = (id: string) => join(CACHE_DIR, `tradelines-${id}.json`);
+
+/** Saved tradelines: our own cache file, else B1's raw report from scripts/crs-smoke.ts. */
+function readTradelinesFromDisk(id: string): Tradeline[] | null {
+  try {
+    const own = readCache(tradelineFile(id));
+    if (own) {
+      const lines = JSON.parse(own);
+      if (Array.isArray(lines)) return lines;
+    }
+    const b1 = readCache(join(CACHE_DIR, `${id.toLowerCase()}-tu-report.response.json`));
+    if (b1) {
+      const body = JSON.parse(b1)?.body;
+      const errors = body?.errorMessages;
+      if (Array.isArray(body?.tradelines) && !(Array.isArray(errors) && errors.length > 0)) return body.tradelines;
+    }
+  } catch (err) {
+    console.warn(`[crs] ignoring unreadable tradeline cache for ${id}: ${(err as Error).message}`);
+  }
+  return null;
 }
 
 async function pullTradelines(userPersona: UserPersona): Promise<Tradeline[]> {
@@ -318,5 +390,6 @@ async function pullTradelines(userPersona: UserPersona): Promise<Tradeline[]> {
   if (!Array.isArray(data?.tradelines)) {
     throw new CrsError(`No tradelines array in credit report (RequestID ${requestId})`, 200, data);
   }
+  writeCache(tradelineFile(userPersona.id), JSON.stringify(data.tradelines, null, 2));
   return data.tradelines;
 }
