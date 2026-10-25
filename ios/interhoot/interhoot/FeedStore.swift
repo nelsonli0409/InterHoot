@@ -9,8 +9,10 @@ final class FeedStore {
     var flagged: [FlaggedNumber] = []
     var lastError: String?
     var lastUpdated: Date?
+    var callBlockingEnabled = false
 
     private let client = SpacetimeClient()
+    private let directory = CallDirectorySync()
     private var pollTask: Task<Void, Never>?
 
     func start() {
@@ -36,6 +38,22 @@ final class FeedStore {
             flagged = flaggedRows.compactMap(FlaggedNumber.init(row:)).sorted { $0.lastSeen > $1.lastSeen }
             lastError = nil
             lastUpdated = Date()
+        } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        // C5: keep the iPhone's block list in step with flagged_number.
+        callBlockingEnabled = await directory.isEnabled()
+        do {
+            try await directory.update(from: flagged)
+        } catch {
+            lastError = "Call blocking: \(error.localizedDescription)"
+        }
+    }
+
+    func openCallBlockingSettings() async {
+        do {
+            try await directory.openSettings()
         } catch {
             lastError = error.localizedDescription
         }

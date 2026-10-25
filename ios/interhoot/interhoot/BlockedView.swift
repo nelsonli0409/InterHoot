@@ -29,6 +29,18 @@ struct BlockedView: View {
                     }
                 }
             }
+            .safeAreaInset(edge: .top) {
+                if !store.callBlockingEnabled {
+                    Button {
+                        Task { await store.openCallBlockingSettings() }
+                    } label: {
+                        Label("Turn on InterHoot under Call Blocking & Identification", systemImage: "phone.badge.checkmark")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.horizontal)
+                }
+            }
             .navigationTitle("Blocked")
             .refreshable { await store.refresh() }
         }

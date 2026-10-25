@@ -413,6 +413,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = calldirectory/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = calldirectory;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -444,6 +445,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = calldirectory/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = calldirectory;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
