@@ -41,6 +41,26 @@ struct BlockedView: View {
                     .padding(.horizontal)
                 }
             }
+            .safeAreaInset(edge: .bottom) {
+                VStack(spacing: 6) {
+                    if let error = store.callBlockingError {
+                        Text("Call blocking error: \(error)").foregroundStyle(.red)
+                    }
+                    if let status = store.callBlockingStatus {
+                        Text("iPhone block list: \(status.blocked) blocked, \(status.labels) labelled, loaded \(status.loadedAt.formatted(date: .omitted, time: .standard))\(status.fileFound ? "" : " (list file not found)")")
+                    } else {
+                        Text("iPhone block list: not loaded yet")
+                    }
+                    Button("Sync now") {
+                        Task { await store.syncCallBlocking(force: true) }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .font(.caption)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity)
+                .background(.bar)
+            }
             .navigationTitle("Blocked")
             .refreshable { await store.refresh() }
         }

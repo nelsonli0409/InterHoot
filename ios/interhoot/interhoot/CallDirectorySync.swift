@@ -16,6 +16,16 @@ struct CallDirectoryList: Codable, Equatable {
     static let fileName = "call-directory.json"
 }
 
+// Written by the extension after each load. Must match calldirectory/CallDirectoryHandler.swift.
+struct CallDirectoryStatus: Codable {
+    let loadedAt: Date
+    let blocked: Int
+    let labels: Int
+    let fileFound: Bool
+
+    static let fileName = "call-directory-status.json"
+}
+
 @MainActor
 final class CallDirectorySync {
     static let extensionID = "com.aslavny.interhoot.calldirectory"
@@ -38,17 +48,29 @@ final class CallDirectorySync {
         try await CXCallDirectoryManager.sharedInstance.openSettings()
     }
 
+    /// Set when the file changed but iOS has not reloaded the extension yet, so a failed reload is retried.
+    private var needsReload = true
+
     /// Rewrites the list when the flagged numbers changed, then reloads the extension if it is enabled.
-    func update(from flagged: [FlaggedNumber]) async throws {
+    func update(from flagged: [FlaggedNumber], force: Bool = false) async throws {
         guard let url = fileURL else { throw SyncError.noAppGroup }
-        let list = Self.makeList(from: flagged)
-        let data = try JSONEncoder().encode(list)
-        if let old = try? Data(contentsOf: url), old == data { return }
-        try data.write(to: url, options: .atomic)
-        // iOS reads the file itself when the user switches the extension on, so skip the reload until then.
-        if await isEnabled() {
-            try await CXCallDirectoryManager.sharedInstance.reloadExtension(withIdentifier: Self.extensionID)
+        let data = try JSONEncoder().encode(Self.makeList(from: flagged))
+        if (try? Data(contentsOf: url)) != data {
+            try data.write(to: url, options: .atomic)
+            needsReload = true
         }
+        guard needsReload || force, await isEnabled() else { return }
+        try await CXCallDirectoryManager.sharedInstance.reloadExtension(withIdentifier: Self.extensionID)
+        needsReload = false
+    }
+
+    /// What the extension last handed to iOS (written by the extension itself), for the Blocked tab.
+    func extensionStatus() -> CallDirectoryStatus? {
+        guard let url = FileManager.default
+                .containerURL(forSecurityApplicationGroupIdentifier: CallDirectoryList.appGroup)?
+                .appendingPathComponent(CallDirectoryStatus.fileName),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(CallDirectoryStatus.self, from: data)
     }
 
     /// CallKit wants each list sorted ascending with no duplicates.

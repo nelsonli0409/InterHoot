@@ -24,6 +24,16 @@ struct CallDirectoryList: Codable {
     static let fileName = "call-directory.json"
 }
 
+// Written after each load so the app can show what iOS actually received.
+struct CallDirectoryStatus: Codable {
+    let loadedAt: Date
+    let blocked: Int
+    let labels: Int
+    let fileFound: Bool
+
+    static let fileName = "call-directory-status.json"
+}
+
 class CallDirectoryHandler: CXCallDirectoryProvider {
 
     override func beginRequest(with context: CXCallDirectoryExtensionContext) {
@@ -35,7 +45,7 @@ class CallDirectoryHandler: CXCallDirectoryProvider {
             context.removeAllIdentificationEntries()
         }
 
-        let list = loadList()
+        let (list, fileFound) = loadList()
         for number in list.blocked {
             context.addBlockingEntry(withNextSequentialPhoneNumber: number)
         }
@@ -43,17 +53,27 @@ class CallDirectoryHandler: CXCallDirectoryProvider {
             context.addIdentificationEntry(withNextSequentialPhoneNumber: entry.number, label: entry.label)
         }
 
+        writeStatus(CallDirectoryStatus(loadedAt: Date(), blocked: list.blocked.count,
+                                        labels: list.labels.count, fileFound: fileFound))
         context.completeRequest()
     }
 
-    private func loadList() -> CallDirectoryList {
-        guard let url = FileManager.default
-                .containerURL(forSecurityApplicationGroupIdentifier: CallDirectoryList.appGroup)?
-                .appendingPathComponent(CallDirectoryList.fileName),
+    private var container: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: CallDirectoryList.appGroup)
+    }
+
+    private func loadList() -> (CallDirectoryList, Bool) {
+        guard let url = container?.appendingPathComponent(CallDirectoryList.fileName),
               let data = try? Data(contentsOf: url),
               let list = try? JSONDecoder().decode(CallDirectoryList.self, from: data)
-        else { return CallDirectoryList(blocked: [], labels: []) }
-        return list
+        else { return (CallDirectoryList(blocked: [], labels: []), false) }
+        return (list, true)
+    }
+
+    private func writeStatus(_ status: CallDirectoryStatus) {
+        guard let url = container?.appendingPathComponent(CallDirectoryStatus.fileName),
+              let data = try? JSONEncoder().encode(status) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 }
 
