@@ -14,3 +14,4 @@ xcuserdata/
 DerivedData/
 *.xcuserstate
 spacetime.local.json
+*.p8
