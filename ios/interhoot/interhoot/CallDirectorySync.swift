@@ -2,8 +2,8 @@ import Foundation
 import CallKit
 
 // Build guide C5, app side. Writes red and yellow numbers into the App Group container and asks
-// iOS to reload the calldirectory extension. Red numbers are blocked and labelled; yellow ones are
-// only labelled. Must match CallDirectoryList in calldirectory/CallDirectoryHandler.swift.
+// iOS to reload the calldirectory extension. Red numbers are blocked; yellow ones are labelled
+// "InterHoot: Suspicious". Must match CallDirectoryList in calldirectory/CallDirectoryHandler.swift.
 struct CallDirectoryList: Codable, Equatable {
     struct Label: Codable, Equatable {
         let number: Int64
@@ -81,8 +81,9 @@ final class CallDirectorySync {
             guard let digits = Int64(number.e164.filter { $0.isASCII && $0.isNumber }) else { continue }
             switch number.flag {
             case "red":
+                // Block only. Apple DTS flagged a number with both a blocking and an identification entry
+                // as conflicting data (developer.apple.com/forums/thread/811182).
                 blocked.insert(digits)
-                labels[digits] = "InterHoot: Scam"
             case "yellow":
                 labels[digits] = "InterHoot: Suspicious"
             default:
