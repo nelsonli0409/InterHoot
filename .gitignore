@@ -1,5 +1,6 @@
 # Secrets: never commit keys (Cartesia track rules: no API keys or secrets in the repo)
 .env
+env
 .env.*
 !.env.example
 .mcp.json
@@ -14,3 +15,7 @@ xcuserdata/
 DerivedData/
 *.xcuserstate
 spacetime.local.json
+*.p8
+server/scripts/out/
+# The server's JSONL copy of every call log (transcripts stay off GitHub)
+server/data/

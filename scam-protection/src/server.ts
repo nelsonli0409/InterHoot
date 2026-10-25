@@ -1,10 +1,22 @@
 
+import "dotenv/config";
 import express from "express";
+import callsRouter from "./routes/calls.js";
+import { setupMediaWebSocket } from "./telephony/media.js";
+import twilioRouter from "./telephony/twilio.js";
 import { detectRisks } from "./riskDetector.js";
 
 const app = express();
 
+app.use("/calls", callsRouter);
+
 const PORT = Number(process.env.PORT) || 3000;
+
+// Allow Express to read Twilio's form data
+app.use("/twilio", express.urlencoded({ extended: false }));
+
+// Register Twilio routes
+app.use("/twilio", twilioRouter);
 
 // Allow Express to read JSON requests
 app.use(express.json());
@@ -36,6 +48,8 @@ app.post("/analyze", (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Scam protection backend running on port ${PORT}`);
 });
+
+setupMediaWebSocket(server);
