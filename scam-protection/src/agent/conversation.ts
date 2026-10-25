@@ -210,6 +210,7 @@ export function receiveCallerResponse(
 
 // Generate a preliminary, rule-based call verdict.
 // This is not a substitute for identity verification.
+
 export function generateVerdict(
   conversation: ConversationState
 ): CallVerdict {
@@ -224,7 +225,7 @@ export function generateVerdict(
     .join(" ")
     .toLowerCase();
 
-  // High-risk requests and payment indicators.
+  // High-risk keywords.
   const redFlags = [
     "gift card",
     "send money",
@@ -239,7 +240,7 @@ export function generateVerdict(
     "social security number",
   ];
 
-  // Potentially suspicious claims or account issues.
+  // Potentially suspicious keywords.
   const yellowFlags = [
     "suspicious transaction",
     "unauthorized transaction",
@@ -254,47 +255,51 @@ export function generateVerdict(
     "security alert",
   ];
 
-  // Check RED indicators first.
+  // RED: High-risk indicators detected.
   if (
     redFlags.some((flag) =>
       transcript.includes(flag)
     )
   ) {
-    console.log(
-      "Screening risk indicator: RED"
-    );
-
+    console.log("Screening verdict: RED");
     return "RED";
   }
 
-  // Check YELLOW indicators.
+  // YELLOW: Suspicious indicators detected.
   if (
     yellowFlags.some((flag) =>
       transcript.includes(flag)
     )
   ) {
-    console.log(
-      "Screening risk indicator: YELLOW"
-    );
-
+    console.log("Screening verdict: YELLOW");
     return "YELLOW";
   }
 
-  // Incomplete or insufficient answers.
+  // YELLOW: Caller failed to answer a question
+  // after the allowed clarification attempts.
   if (conversation.unverifiedAnswers > 0) {
     console.log(
-      "Unverified caller answers:",
+      "Unverified answers:",
       conversation.unverifiedAnswers
     );
 
     return "YELLOW";
   }
 
-  // Until independent caller verification is
-  // implemented, do not automatically approve calls.
+  // YELLOW: Missing screening responses.
+  // There should be at least four:
+  // one introduction and three follow-up answers.
+  if (conversation.callerResponses.length < 4) {
+    console.log("Incomplete screening responses.");
+    return "YELLOW";
+  }
+
+  // GREEN: All screening checks passed.
+  // WARNING: This is for controlled testing only.
+  // It does not independently verify caller identity.
   console.log(
-    "Caller identity not independently verified."
+    "Screening verdict: GREEN (test approval)"
   );
 
-  return "YELLOW";
+  return "GREEN";
 }

@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 import twilio from "twilio";
 import type { CallVerdict } from "../agent/conversation.js";
@@ -13,7 +14,16 @@ export function buildVerdictTwiml(
 
   if (verdict === "GREEN") {
     if (protectedNumber) {
-      response.say("Your call has been approved. Connecting you now.");
+      if (!/^\+[1-9]\d{1,14}$/.test(protectedNumber)) {
+        throw new Error(
+          "PROTECTED_PHONE_NUMBER must use E.164 format."
+        );
+      }
+
+      response.say(
+        "Your call has been approved. Connecting you now."
+      );
+
       response.dial(protectedNumber);
     } else {
       response.say(
@@ -21,14 +31,17 @@ export function buildVerdictTwiml(
           "We're unable to connect you at this time. " +
           "We appreciate your patience. Have a wonderful day. Goodbye!"
       );
+
       response.hangup();
     }
+
     return response.toString();
   }
 
   if (verdict === "YELLOW" || verdict === "RED") {
     response.say(UNCONNECTED_CLOSING_MESSAGE);
     response.hangup();
+
     return response.toString();
   }
 
@@ -52,8 +65,16 @@ export async function applyCallVerdict(
   protectedNumber?: string
 ): Promise<void> {
   const client = createTwilioClient();
-  const twiml = buildVerdictTwiml(verdict, protectedNumber);
-  const updatedCall = await client.calls(callSid).update({ twiml });
+
+  const twiml = buildVerdictTwiml(
+    verdict,
+    protectedNumber
+  );
+
+  const updatedCall = await client
+    .calls(callSid)
+    .update({ twiml });
+
   console.log("Call updated:", updatedCall.sid);
   console.log("Verdict applied:", verdict);
 }
