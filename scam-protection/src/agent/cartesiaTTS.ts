@@ -1,8 +1,5 @@
 
 import "dotenv/config";
-import type {
-  ScreeningLanguage,
-} from "./screeningLanguages.js";
 
 const CARTESIA_TTS_URL =
   "https://api.cartesia.ai/tts/bytes";
@@ -13,7 +10,8 @@ const VOICE_ID =
 export async function generateSpeech(
   text: string,
   signal?: AbortSignal,
-  language: ScreeningLanguage = "en"
+  // Any sonic-3 language code (see TTS_LANGUAGES in screeningLanguages.ts)
+  language: string = "en"
 ): Promise<Buffer> {
   const apiKey = process.env.CARTESIA_API_KEY;
 

@@ -15,8 +15,24 @@ type TranscriptEvent = {
   [key: string]: unknown;
 };
 
+// Build guide section 4 and A7: ink-2 (built-in turn detection) when the user's language is one of
+// its five, ink-whisper otherwise. CARTESIA_STT_MODEL=ink-whisper (or ink-2) overrides the choice.
+const INK2_LANGUAGES = new Set(["en", "fr", "hi", "ja", "es"]);
+
+export type SttModel = "ink-2" | "ink-whisper";
+
+export function chooseSttModel(language?: string): SttModel {
+  const forced = process.env.CARTESIA_STT_MODEL?.trim();
+  if (forced === "ink-2" || forced === "ink-whisper") return forced;
+  const base = (language ?? "").trim().split(/[-_]/)[0].toLowerCase();
+  return INK2_LANGUAGES.has(base) ? "ink-2" : "ink-whisper";
+}
+
 export class CartesiaSTT {
   private ws: WebSocket | null = null;
+
+  private model: SttModel;
+  private fellBack = false;
 
   // Buffer audio while Cartesia connects.
   private pending: Buffer[] = [];
@@ -38,8 +54,11 @@ export class CartesiaSTT {
 
   constructor(
     private readonly callSid: string,
-    private readonly onUtterance?: (text: string) => void
-  ) {}
+    private readonly onUtterance?: (text: string) => void,
+    options: { language?: string } = {}
+  ) {
+    this.model = chooseSttModel(options.language);
+  }
 
   connect(): void {
     const apiKey = process.env.CARTESIA_API_KEY;
@@ -51,6 +70,145 @@ export class CartesiaSTT {
       return;
     }
 
+    console.log("Cartesia STT model:", this.model);
+
+    if (this.model === "ink-2") {
+      this.connectInk2(apiKey);
+      return;
+    }
+
+    this.connectWhisper(apiKey);
+  }
+
+  // Realtime STT (Auto), wss://api.cartesia.ai/stt/turns/websocket
+  // (docs.cartesia.ai/api-reference/stt/turns/websocket). Cartesia decides
+  // when the caller's turn is over and sends turn.end with the whole
+  // turn's transcript, so no pause timer is needed.
+  private connectInk2(apiKey: string): void {
+    const url = new URL(
+      "wss://api.cartesia.ai/stt/turns/websocket"
+    );
+
+    url.searchParams.set("model", "ink-2");
+    url.searchParams.set("encoding", "pcm_mulaw");
+    url.searchParams.set("sample_rate", "8000");
+    url.searchParams.set("cartesia_version", "2026-08-14");
+
+    const ws = new WebSocket(url.toString(), {
+      headers: {
+        "X-API-Key": apiKey,
+      },
+    });
+
+    this.ws = ws;
+
+    ws.on("open", () => {
+      if (this.stopped || this.ws !== ws) {
+        ws.close();
+        return;
+      }
+
+      console.log("Cartesia STT connected (ink-2):", this.callSid);
+
+      for (const chunk of this.pending) {
+        ws.send(chunk, { binary: true });
+      }
+
+      this.pending = [];
+      this.pendingBytes = 0;
+    });
+
+    ws.on("message", (raw) => {
+      if (this.stopped || this.ws !== ws) {
+        return;
+      }
+
+      let event: TranscriptEvent;
+
+      try {
+        event = JSON.parse(raw.toString()) as TranscriptEvent;
+      } catch (error) {
+        console.error("Cartesia STT message processing error:", error);
+        return;
+      }
+
+      if (event.type === "error") {
+        console.error("Cartesia STT error event:", event);
+        this.fallBackToWhisper(apiKey);
+        return;
+      }
+
+      if (
+        event.type !== "turn.end" ||
+        typeof event.transcript !== "string"
+      ) {
+        return;
+      }
+
+      const text = event.transcript.trim();
+
+      if (!text) {
+        return;
+      }
+
+      console.log("Complete caller response:", text);
+
+      try {
+        this.onUtterance?.(text);
+      } catch (error) {
+        console.error("Caller utterance callback failed:", error);
+      }
+    });
+
+    ws.on("error", (error) => {
+      console.error(
+        "Cartesia STT WebSocket error:",
+        error.message
+      );
+    });
+
+    ws.on("close", (code, reason) => {
+      console.log(
+        "Cartesia STT disconnected (ink-2):",
+        this.callSid,
+        code,
+        reason.toString()
+      );
+
+      // Closed by Cartesia, not by us: carry on with ink-whisper.
+      if (!this.stopped && this.ws === ws) {
+        this.fallBackToWhisper(apiKey);
+      }
+    });
+  }
+
+  // ink-2 failed (bad upgrade, error event, or closed early): reconnect
+  // with ink-whisper on the endpoint below, once.
+  private fallBackToWhisper(apiKey: string): void {
+    if (this.stopped || this.fellBack) {
+      return;
+    }
+
+    this.fellBack = true;
+    this.model = "ink-whisper";
+
+    console.warn(
+      "Cartesia ink-2 unavailable, switching to ink-whisper:",
+      this.callSid
+    );
+
+    const old = this.ws;
+
+    this.connectWhisper(apiKey);
+
+    if (old?.readyState === WebSocket.OPEN) {
+      old.close();
+    } else if (old?.readyState === WebSocket.CONNECTING) {
+      old.terminate();
+    }
+  }
+
+  private connectWhisper(apiKey: string): void {
     const url = new URL(
       "wss://api.cartesia.ai/stt/websocket"
     );
@@ -302,8 +460,12 @@ export class CartesiaSTT {
     }
 
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send("finalize");
-      ws.send("done");
+      if (this.model === "ink-2") {
+        ws.send(JSON.stringify({ type: "close" }));
+      } else {
+        ws.send("finalize");
+        ws.send("done");
+      }
       ws.close();
     } else if (
       ws.readyState === WebSocket.CONNECTING

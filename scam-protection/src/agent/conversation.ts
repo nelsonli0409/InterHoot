@@ -1,3 +1,9 @@
+import {
+  DEFAULT_LANGUAGE,
+  getGreetingParts,
+  getScreeningQuestion,
+  type ScreeningLanguage,
+} from "./screeningLanguages.js";
 
 export type ConversationStage =
   | "greeting"
@@ -19,10 +25,26 @@ export type ConversationState = {
   clarificationAttempts: number;
   needsClarification: boolean;
   unverifiedAnswers: number;
+
+  // The protected user's language; the greeting is in it and then in English.
+  language: ScreeningLanguage;
+  // The current question takes any non-empty answer: Gemini's questions and the translated
+  // questions have no format rule, and the clarification lines exist only in English.
+  acceptAnyAnswer: boolean;
+};
+
+// Options for the next follow-up question.
+export type NextLineOptions = {
+  // Gemini's next_agent_line (build guide A5). Used instead of the fixed question when set.
+  followUp?: string;
+  // Language of the fixed question when Gemini has no line.
+  language?: ScreeningLanguage;
 };
 
 // Create a new conversation
-export function createConversation(): ConversationState {
+export function createConversation(
+  language: ScreeningLanguage = DEFAULT_LANGUAGE
+): ConversationState {
   return {
     stage: "greeting",
     callerName: null,
@@ -34,6 +56,9 @@ export function createConversation(): ConversationState {
     clarificationAttempts: 0,
     needsClarification: false,
     unverifiedAnswers: 0,
+
+    language,
+    acceptAnyAnswer: false,
   };
 }
 
@@ -71,14 +96,17 @@ function isValidAnswer(
 
 // Generate InterHoot's next line
 export function getNextAgentLine(
-  conversation: ConversationState
+  conversation: ConversationState,
+  options: NextLineOptions = {}
 ): string {
   // Initial greeting
   if (conversation.stage === "greeting") {
     conversation.stage = "identifying";
     conversation.waitingForResponse = true;
 
-    return "Hello! This is InterHoot. May I ask who's calling and why?";
+    return getGreetingParts(conversation.language)
+      .map((part) => part.text)
+      .join(" ");
   }
 
   // Wait for the caller's introduction
@@ -114,10 +142,18 @@ export function getNextAgentLine(
       "Is there an official phone number where your organization can be reached?",
     ];
 
-    // Ask the next follow-up question.
+    // Ask the next follow-up question: Gemini's line, else the fixed one.
     if (conversation.followupCount < questions.length) {
-      const question = questions[conversation.followupCount];
+      const followUp = options.followUp?.trim();
+      const language = options.language ?? DEFAULT_LANGUAGE;
 
+      const question =
+        followUp ||
+        (language === "en"
+          ? questions[conversation.followupCount]
+          : getScreeningQuestion(language, conversation.followupCount + 1));
+
+      conversation.acceptAnyAnswer = Boolean(followUp) || language !== "en";
       conversation.followupCount++;
       conversation.waitingForResponse = true;
 
@@ -163,7 +199,9 @@ export function receiveCallerResponse(
     // Save every answer for risk assessment.
     conversation.callerResponses.push(answer);
 
-    const valid = isValidAnswer(questionIndex, answer);
+    const valid =
+      conversation.acceptAnyAnswer ||
+      isValidAnswer(questionIndex, answer);
 
     if (valid) {
       conversation.clarificationAttempts = 0;

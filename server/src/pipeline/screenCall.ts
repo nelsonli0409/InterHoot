@@ -1,9 +1,15 @@
 // End-to-end glue for one phone call (test_main): A's telephony server calls these through the HTTP
 // routes in ../index.ts. B's brain decides the flag; C's storage and push record it and alert the user.
 //
-//   precheck()   when the call rings: reject hidden caller IDs and numbers already flagged red
-//   screenCall() when A's questions are done: Gemini → CRS caller check → claim check → score,
-//                then log to SpacetimeDB, flag the number, and push yellow/red alerts
+//   precheck()       when the call rings: reject hidden caller IDs and numbers already flagged red
+//   getUserLanguage() before the greeting: protected_user.language (A7)
+//   nextTurn()       before each follow-up: Gemini's next_agent_line (A5)
+//   screenCall()     when A's questions are done: Gemini → CRS caller check → claim check → score,
+//                    then log to SpacetimeDB and the JSONL copy, flag the number, and push yellow/red alerts
+//   addCallMessage() yellow calls only: the caller's message joins the log, then the push goes out
+import { appendFile, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { analyzeTurn, forgetCall } from "../brain/gemini.js";
 import { recordVerdict, scoreCall, type ScoreInput } from "../brain/score.js";
 import type { Flag, GeminiTurn, TranscriptTurn } from "../brain/types.js";
@@ -13,7 +19,7 @@ import { getTradelines } from "../crs/crs.js";
 import { getUserPersona } from "../crs/personas.js";
 import { notifyVerdict } from "../push/notify.js";
 import { getStore } from "../storage/index.js";
-import { getProtectedUser, logFullCall } from "../storage/spacetime.js";
+import { getProtectedUser, logFullCall, type FullCallLog } from "../storage/spacetime.js";
 
 const E164 = /^\+[1-9]\d{6,14}$/;
 // Twilio's From for withheld caller ID is "anonymous"; older calls used the digits for ANONYMOUS.
@@ -28,7 +34,18 @@ export function hasCallerId(from: string): boolean {
 /** What call_log stores as the caller: the E.164 number, or "anonymous" (the module accepts both). */
 const callerForLog = (from: string) => (hasCallerId(from) ? from : "anonymous");
 
-function logAndNotify(args: {
+// Build guide section 5 (redundancy): every call_log row is also appended here, one JSON object per line.
+// A call can appear twice (a yellow call is logged again once the caller's message arrives); the last line wins.
+const callLogJsonl = () =>
+  process.env.CALL_LOG_JSONL || fileURLToPath(new URL("../../data/call-log.jsonl", import.meta.url));
+
+async function appendJsonl(row: FullCallLog): Promise<void> {
+  const file = callLogJsonl();
+  await mkdir(dirname(file), { recursive: true });
+  await appendFile(file, `${JSON.stringify({ ...row, logged_at: new Date().toISOString() })}\n`);
+}
+
+interface LogArgs {
   callId: string;
   userId: string;
   from: string;
@@ -40,31 +57,109 @@ function logAndNotify(args: {
   evidenceJson: string;
   summary: string;
   startedAt: number;
-}): Promise<void> {
-  const caller = callerForLog(args.from);
-  const tasks: Promise<unknown>[] = [
-    logFullCall({
-      call_id: args.callId,
-      user_id: args.userId,
-      caller_e164: caller,
-      started_at: args.startedAt,
-      flag: args.flag,
-      score: args.score,
-      scam_type: args.scamType,
-      transcript: args.transcript,
-      claims_json: args.claimsJson,
-      crs_evidence_json: args.evidenceJson,
-      summary: args.summary,
-    }).catch((err) => console.error(`[pipeline] log_call failed for ${args.callId}:`, (err as Error).message)),
-  ];
+}
+
+function writeLog(row: FullCallLog): Promise<void> {
+  return Promise.all([
+    logFullCall(row).catch((err) => console.error(`[pipeline] log_call failed for ${row.call_id}:`, (err as Error).message)),
+    appendJsonl(row).catch((err) => console.error(`[pipeline] JSONL copy failed for ${row.call_id}:`, (err as Error).message)),
+  ]).then(() => undefined);
+}
+
+function push(row: FullCallLog): Promise<void> {
+  const caller = row.caller_e164 === "anonymous" ? "No caller ID" : row.caller_e164;
+  return notifyVerdict({ userId: row.user_id, flag: row.flag, callerE164: caller, summary: row.summary, callId: row.call_id })
+    .then((r) => console.log(`[pipeline] push for ${row.call_id}:`, r === "skipped" ? "skipped" : r.ok ? "sent" : `${r.status} ${r.reason ?? ""}`))
+    .catch((err) => console.error(`[pipeline] push failed for ${row.call_id}:`, (err as Error).message));
+}
+
+// Yellow calls (build guide section 7): the agent takes a message before hanging up, and the push waits
+// for it. If the message never comes (the caller hangs up, or A's server is down), the push goes anyway.
+const MESSAGE_WAIT_MS = 90_000;
+const pendingMessages = new Map<string, { row: FullCallLog; timer: ReturnType<typeof setTimeout> }>();
+
+function holdPush(row: FullCallLog): void {
+  const timer = setTimeout(() => {
+    pendingMessages.delete(row.call_id);
+    void push(row);
+  }, MESSAGE_WAIT_MS);
+  pendingMessages.set(row.call_id, { row, timer });
+}
+
+/** Adds the caller's message to a yellow call's log and sends its push. False if no message was expected. */
+export async function addCallMessage(callId: string, message: string): Promise<boolean> {
+  const pending = pendingMessages.get(callId);
+  if (!pending) return false;
+  pendingMessages.delete(callId);
+  clearTimeout(pending.timer);
+  let row = pending.row;
+  const text = message.trim().slice(0, 1000);
+  if (text) {
+    row = {
+      ...row,
+      summary: `${row.summary}\nCaller's message: "${text}"`,
+      transcript: `${row.transcript}\nCaller (message): ${text}`.trim(),
+    };
+    await writeLog(row);
+  }
+  await push(row);
+  return true;
+}
+
+function logAndNotify(args: LogArgs, opts: { holdPushForMessage?: boolean } = {}): Promise<void> {
+  const row: FullCallLog = {
+    call_id: args.callId,
+    user_id: args.userId,
+    caller_e164: callerForLog(args.from),
+    started_at: args.startedAt,
+    flag: args.flag,
+    score: args.score,
+    scam_type: args.scamType,
+    transcript: args.transcript,
+    claims_json: args.claimsJson,
+    crs_evidence_json: args.evidenceJson,
+    summary: args.summary,
+  };
+  const tasks: Promise<void>[] = [writeLog(row)];
   if (args.flag !== "green") {
-    tasks.push(
-      notifyVerdict({ userId: args.userId, flag: args.flag, callerE164: caller === "anonymous" ? "No caller ID" : caller, summary: args.summary, callId: args.callId })
-        .then((r) => console.log(`[pipeline] push for ${args.callId}:`, r === "skipped" ? "skipped" : r.ok ? "sent" : `${r.status} ${r.reason ?? ""}`))
-        .catch((err) => console.error(`[pipeline] push failed for ${args.callId}:`, (err as Error).message)),
-    );
+    if (opts.holdPushForMessage) holdPush(row);
+    else tasks.push(push(row));
   }
   return Promise.all(tasks).then(() => undefined);
+}
+
+// protected_user.language from onboarding, cached for a minute (A asks before every greeting).
+const languageCache = new Map<string, { language: string; at: number }>();
+
+export async function getUserLanguage(userId = DEFAULT_USER_ID): Promise<string> {
+  const hit = languageCache.get(userId);
+  if (hit && Date.now() - hit.at < 60_000) return hit.language;
+  try {
+    const language = (await getProtectedUser(userId))?.language || "en";
+    languageCache.set(userId, { language, at: Date.now() });
+    return language;
+  } catch (err) {
+    console.error(`[pipeline] protected_user lookup failed for ${userId}:`, (err as Error).message);
+    return "en";
+  }
+}
+
+export interface NextTurnResult {
+  nextAgentLine: string;
+  callerLanguage: string;
+  scamProbability: number;
+}
+
+/** A5: Gemini writes the agent's next follow-up question from the conversation so far. */
+export async function nextTurn(
+  callId: string,
+  transcript: TranscriptTurn[],
+  followUpsAsked: number,
+  userId = DEFAULT_USER_ID,
+): Promise<NextTurnResult> {
+  const userLanguage = await getUserLanguage(userId);
+  const turn = await analyzeTurn({ transcript, userLanguage, followUpsAsked, callId });
+  return { nextAgentLine: turn.next_agent_line, callerLanguage: turn.caller_language, scamProbability: turn.scam_probability };
 }
 
 export interface PrecheckResult {
@@ -100,6 +195,8 @@ export interface ScreenCallInput {
   fallbackFlag?: Flag;
   /** Log this flag no matter what the brain says (A's timeout path ends the call as yellow). */
   forceFlag?: Flag;
+  /** A will take a message on a yellow call, so hold the push until addCallMessage(). */
+  deferYellowNotify?: boolean;
 }
 
 export interface ScreenCallResult {
@@ -109,6 +206,8 @@ export interface ScreenCallResult {
   summary: string;
   /** protected_user.real_phone_e164 from onboarding, for forwarding green calls. */
   forwardTo: string | null;
+  /** True when the push is waiting for the caller's message (yellow, with deferYellowNotify). */
+  messagePending: boolean;
 }
 
 const NEUTRAL_TURN: GeminiTurn = {
@@ -185,19 +284,23 @@ export async function screenCall(input: ScreenCallInput): Promise<ScreenCallResu
   await recordVerdict(scoreInput, { ...result, flag, reasons }).catch((err) =>
     console.error(`[pipeline] recordVerdict failed for ${input.callId}:`, (err as Error).message),
   );
-  await logAndNotify({
-    callId: input.callId,
-    userId,
-    from: input.from,
-    flag,
-    score: result.score,
-    scamType: turn.scam_type,
-    transcript: transcriptText,
-    claimsJson: JSON.stringify(turn.claims),
-    evidenceJson: JSON.stringify({ evidence: verify.evidence, reasons, caller: signals, breakdown: result.breakdown }),
-    summary,
-    startedAt,
-  });
+  const messagePending = flag === "yellow" && Boolean(input.deferYellowNotify);
+  await logAndNotify(
+    {
+      callId: input.callId,
+      userId,
+      from: input.from,
+      flag,
+      score: result.score,
+      scamType: turn.scam_type,
+      transcript: transcriptText,
+      claimsJson: JSON.stringify(turn.claims),
+      evidenceJson: JSON.stringify({ evidence: verify.evidence, reasons, caller: signals, breakdown: result.breakdown }),
+      summary,
+      startedAt,
+    },
+    { holdPushForMessage: messagePending },
+  );
 
-  return { flag, score: result.score, reasons, summary, forwardTo: user?.realPhoneE164 || null };
+  return { flag, score: result.score, reasons, summary, forwardTo: user?.realPhoneE164 || null, messagePending };
 }

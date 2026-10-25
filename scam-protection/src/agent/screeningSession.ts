@@ -6,7 +6,10 @@ import {
   generateVerdict,
   type ConversationState,
   type CallVerdict,
+  type NextLineOptions,
 } from "./conversation.js";
+
+import type { ScreeningLanguage } from "./screeningLanguages.js";
 
 import {
   createCallTranscript,
@@ -27,13 +30,14 @@ const screeningSessions = new Map<string, ScreeningSession>();
 
 // Start a new screening session
 export function createScreeningSession(
-  callSid: string
+  callSid: string,
+  language?: ScreeningLanguage
 ): ScreeningSession {
   if (screeningSessions.has(callSid)) {
     throw new Error("Screening session already exists.");
   }
 
-  const conversation = createConversation();
+  const conversation = createConversation(language);
 
   createCallTranscript(callSid);
 
@@ -49,7 +53,8 @@ export function createScreeningSession(
 
 // Generate the next question and record it
 export function askNextQuestion(
-  callSid: string
+  callSid: string,
+  options?: NextLineOptions
 ): string {
   const session = screeningSessions.get(callSid);
 
@@ -62,7 +67,8 @@ export function askNextQuestion(
     session.conversation.followupCount;
 
   const question = getNextAgentLine(
-    session.conversation
+    session.conversation,
+    options
   );
 
   // Record only newly generated questions.
@@ -78,6 +84,31 @@ export function askNextQuestion(
   }
 
   return question;
+}
+
+// Whether the next line is the greeting
+export function isAtGreeting(callSid: string): boolean {
+  return screeningSessions.get(callSid)?.conversation.stage === "greeting";
+}
+
+// When the next line is a new follow-up question (not a clarification
+// or the end), how many follow-ups were asked before it. Otherwise null.
+export function getFollowUpState(
+  callSid: string
+): { followUpsAsked: number } | null {
+  const conversation = screeningSessions.get(callSid)?.conversation;
+
+  if (
+    !conversation ||
+    conversation.stage !== "followup" ||
+    conversation.waitingForResponse ||
+    conversation.needsClarification ||
+    conversation.followupCount >= 3
+  ) {
+    return null;
+  }
+
+  return { followUpsAsked: conversation.followupCount };
 }
 
 // Process a caller response and record it

@@ -29,14 +29,37 @@ import {
   getScreeningTranscript,
   removeScreeningSession,
   getActiveScreeningCount,
+  isAtGreeting,
+  getFollowUpState,
 } from "../agent/screeningSession.js";
+
+import type { NextLineOptions } from "../agent/conversation.js";
+
+import {
+  baseLanguage,
+  getGreetingParts,
+  messagePrompts,
+  toScreeningLanguage,
+  TTS_LANGUAGES,
+  type ScreeningLanguage,
+  type SpeechPart,
+} from "../agent/screeningLanguages.js";
 
 import { applyCallVerdict } from "./callActions.js";
 import { processTwilioAudio } from "./audioProcessor.js";
 import { generateSpeech } from "../agent/cartesiaTTS.js";
 import { sendAudioToTwilio } from "./sendAudio.js";
 import { CartesiaSTT } from "../agent/cartesiaSTT.js";
-import { screenWithBrain, toCallVerdict } from "./brainClient.js";
+import {
+  getCallContext,
+  nextTurn,
+  screenWithBrain,
+  sendCallMessage,
+  toCallVerdict,
+} from "./brainClient.js";
+
+// How long a yellow caller gets to leave a message after the prompt starts.
+const MESSAGE_LISTEN_MS = 30_000;
 
 type TurnState =
   | "starting"
@@ -104,6 +127,16 @@ export function setupMediaWebSocket(server: Server): void {
     let callerFrom = "";
     const callStartedAt = Date.now();
 
+    // protected_user.language, read from the brain before the greeting (A7).
+    let userLanguage = "en";
+    // The caller's language as Gemini last heard it, when there are fixed lines for it.
+    let callerLanguage: ScreeningLanguage | null = null;
+
+    // Yellow calls: the agent takes a message after the verdict.
+    let takingMessage = false;
+    let finishMessage: ((text: string) => void) | null = null;
+    const messageController = new AbortController();
+
     let mediaChunkCount = 0;
     let sessionCreated = false;
     let screeningCreated = false;
@@ -121,10 +154,14 @@ export function setupMediaWebSocket(server: Server): void {
     function cleanupSession(): void {
       if (cleanedUp) return;
 
+      // Hand back whatever message we have so the push still goes out.
+      finishMessage?.("");
+
       cleanedUp = true;
       turnState = "finished";
 
       speechController.abort();
+      messageController.abort();
 
       stt?.close();
       stt = null;
@@ -159,7 +196,10 @@ export function setupMediaWebSocket(server: Server): void {
     ): void {
       if (cleanedUp) return;
 
+      finishMessage?.("");
+
       speechController.abort();
+      messageController.abort();
 
       stt?.close();
       stt = null;
@@ -272,16 +312,36 @@ export function setupMediaWebSocket(server: Server): void {
       }
     }
 
-    // Generate and play an InterHoot question.
+    // Cartesia TTS for one part. A language Cartesia rejects is retried in English.
+    async function synthesize(
+      part: SpeechPart,
+      signal: AbortSignal
+    ): Promise<Buffer> {
+      try {
+        return await generateSpeech(part.text, signal, part.language);
+      } catch (error) {
+        if (part.language === "en" || signal.aborted) throw error;
+
+        console.error(
+          `TTS failed in ${part.language}, retrying in English:`,
+          error instanceof Error ? error.message : error
+        );
+
+        return generateSpeech(part.text, signal, "en");
+      }
+    }
+
+    // Generate and play an InterHoot line (one or more language parts).
     async function speak(
-      text: string,
+      parts: SpeechPart[],
       expectedCallSid: string,
-      expectedStreamSid: string
+      expectedStreamSid: string,
+      signal: AbortSignal = speechController.signal
     ): Promise<void> {
       if (
         cleanedUp ||
         timedOut ||
-        verdictSubmitted
+        (verdictSubmitted && !takingMessage)
       ) {
         return;
       }
@@ -293,18 +353,20 @@ export function setupMediaWebSocket(server: Server): void {
 
       expectedPlaybackMark = markName;
 
-      console.log("InterHoot asks:", text);
+      console.log(
+        "InterHoot asks:",
+        parts.map((part) => `[${part.language}] ${part.text}`).join(" ")
+      );
 
       try {
-        const audio = await generateSpeech(
-          text,
-          speechController.signal
+        const audio = await Promise.all(
+          parts.map((part) => synthesize(part, signal))
         );
 
         if (
           cleanedUp ||
           timedOut ||
-          verdictSubmitted ||
+          (verdictSubmitted && !takingMessage) ||
           callSid !== expectedCallSid ||
           streamSid !== expectedStreamSid ||
           ws.readyState !== WebSocket.OPEN
@@ -312,11 +374,13 @@ export function setupMediaWebSocket(server: Server): void {
           return;
         }
 
-        sendAudioToTwilio(
-          ws,
-          expectedStreamSid,
-          audio
-        );
+        for (const chunk of audio) {
+          sendAudioToTwilio(
+            ws,
+            expectedStreamSid,
+            chunk
+          );
+        }
 
         // Wait until Twilio finishes playing this question.
         ws.send(
@@ -337,11 +401,175 @@ export function setupMediaWebSocket(server: Server): void {
         if (
           cleanedUp ||
           timedOut ||
-          speechController.signal.aborted
+          signal.aborted
         ) {
           return;
         }
 
+        handleConnectionError(
+          "WEBSOCKET_ERROR",
+          error
+        );
+      }
+    }
+
+    function openStt(
+      sid: string,
+      onUtterance: (text: string) => void
+    ): CartesiaSTT {
+      const client = new CartesiaSTT(sid, onUtterance, {
+        language: userLanguage,
+      });
+
+      client.connect();
+
+      return client;
+    }
+
+    // Yellow calls (build guide section 7): ask for a short message and
+    // wait for one answer, or MESSAGE_LISTEN_MS. Resolves with the text.
+    function takeMessage(
+      expectedCallSid: string,
+      expectedStreamSid: string
+    ): Promise<string> {
+      return new Promise((resolve) => {
+        const language = callerLanguage ?? "en";
+
+        let done = false;
+
+        const finish = (text: string) => {
+          if (done) return;
+
+          done = true;
+          clearTimeout(timer);
+
+          takingMessage = false;
+          finishMessage = null;
+          turnState = "finished";
+          expectedPlaybackMark = null;
+
+          stt?.close();
+          stt = null;
+
+          resolve(text);
+        };
+
+        const timer = setTimeout(() => finish(""), MESSAGE_LISTEN_MS);
+
+        takingMessage = true;
+        finishMessage = finish;
+
+        stt = openStt(expectedCallSid, (text) => {
+          if (takingMessage && turnState === "listening") {
+            console.log("Caller message:", text);
+            finish(text);
+          }
+        });
+
+        void speak(
+          [{ text: messagePrompts[language], language }],
+          expectedCallSid,
+          expectedStreamSid,
+          messageController.signal
+        );
+      });
+    }
+
+    // A5: Gemini writes the follow-up questions. Without a usable line
+    // (slow, down, or a language TTS can't speak), A's fixed question is used.
+    async function chooseFollowUp(
+      expectedCallSid: string,
+      followUpsAsked: number
+    ): Promise<{ options: NextLineOptions; language: string }> {
+      const turn = await nextTurn({
+        callSid: expectedCallSid,
+        transcript: getScreeningTranscript(expectedCallSid),
+        followUpsAsked,
+      });
+
+      const spoken = baseLanguage(turn?.callerLanguage);
+
+      callerLanguage = toScreeningLanguage(spoken) ?? callerLanguage;
+
+      const fixedLanguage = callerLanguage ?? "en";
+
+      if (turn?.nextAgentLine.trim() && TTS_LANGUAGES.has(spoken)) {
+        return {
+          options: { followUp: turn.nextAgentLine, language: fixedLanguage },
+          language: spoken,
+        };
+      }
+
+      return {
+        options: { language: fixedLanguage },
+        language: fixedLanguage,
+      };
+    }
+
+    // A7: read the user's language, then start STT and the greeting.
+    async function beginScreening(
+      newCallSid: string,
+      newStreamSid: string
+    ): Promise<void> {
+      const context = await getCallContext(newCallSid);
+
+      if (cleanedUp || timedOut || callSid !== newCallSid) return;
+
+      userLanguage = baseLanguage(context?.language) || "en";
+
+      console.log("Protected user's language:", userLanguage);
+
+      try {
+        createScreeningSession(
+          newCallSid,
+          toScreeningLanguage(userLanguage) ?? "en"
+        );
+        screeningCreated = true;
+
+        // Connect Cartesia speech recognition.
+        stt = openStt(newCallSid, (completeResponse) => {
+          if (
+            cleanedUp ||
+            timedOut ||
+            verdictSubmitted ||
+            !screeningCreated ||
+            turnState !== "listening"
+          ) {
+            console.log(
+              "STT response ignored:",
+              completeResponse
+            );
+            return;
+          }
+
+          turnState = "processing";
+
+          console.log(
+            "Caller response:",
+            completeResponse
+          );
+
+          submitCallerResponse(
+            newCallSid,
+            completeResponse
+          );
+
+          console.log(
+            "Caller response saved"
+          );
+
+          void advanceConversation(
+            newCallSid,
+            newStreamSid
+          );
+        });
+
+        // Start InterHoot's greeting.
+        void advanceConversation(
+          newCallSid,
+          newStreamSid
+        );
+      } catch (error) {
         handleConnectionError(
           "WEBSOCKET_ERROR",
           error
@@ -366,8 +594,28 @@ export function setupMediaWebSocket(server: Server): void {
       turnState = "processing";
 
       try {
+        const greeting = isAtGreeting(expectedCallSid);
+        const followUp = getFollowUpState(expectedCallSid);
+
+        let options: NextLineOptions = {};
+        // Clarifications exist only in English.
+        let lineLanguage = "en";
+
+        if (followUp) {
+          const choice = await chooseFollowUp(
+            expectedCallSid,
+            followUp.followUpsAsked
+          );
+
+          if (cleanedUp || timedOut || verdictSubmitted) return;
+
+          options = choice.options;
+          lineLanguage = choice.language;
+        }
+
         const nextLine = askNextQuestion(
-          expectedCallSid
+          expectedCallSid,
+          options
         );
 
         // The conversation has finished.
@@ -401,10 +649,26 @@ export function setupMediaWebSocket(server: Server): void {
             transcript: getScreeningTranscript(expectedCallSid),
             fallbackVerdict: verdict,
             startedAt: callStartedAt,
+            deferYellowNotify: true,
           });
           const finalVerdict = brain ? toCallVerdict(brain.flag) : verdict;
 
           console.log("Brain verdict:", brain ? `${brain.flag} (${brain.score})` : "unavailable");
+
+          // YELLOW: take a message first. The brain sends the push with it.
+          if (finalVerdict === "YELLOW" && brain?.messagePending) {
+            const message = cleanedUp
+              ? ""
+              : await takeMessage(expectedCallSid, expectedStreamSid);
+
+            const sent = await sendCallMessage(expectedCallSid, message);
+
+            console.log(
+              "Caller message:",
+              message ? `"${message}"` : "(none)",
+              sent ? "saved" : "not saved"
+            );
+          }
 
           // GREEN automatically forwards to the protected number.
           // YELLOW and RED end the call.
@@ -443,9 +707,14 @@ export function setupMediaWebSocket(server: Server): void {
           return;
         }
 
-        // Ask the next question or clarification.
+        // Ask the next question or clarification. The greeting is in
+        // the user's language, then English.
+        const parts: SpeechPart[] = greeting
+          ? getGreetingParts(toScreeningLanguage(userLanguage) ?? "en")
+          : [{ text: nextLine, language: lineLanguage }];
+
         await speak(
-          nextLine,
+          parts,
           expectedCallSid,
           expectedStreamSid
         );
@@ -532,9 +801,6 @@ export function setupMediaWebSocket(server: Server): void {
             createCallSession(newCallSid);
             sessionCreated = true;
 
-            createScreeningSession(newCallSid);
-            screeningCreated = true;
-
             // Start the overall screening deadline.
             startCallTimeout(
               newCallSid,
@@ -552,51 +818,8 @@ export function setupMediaWebSocket(server: Server): void {
               "seconds"
             );
 
-            // Connect Cartesia speech recognition.
-            stt = new CartesiaSTT(
-              newCallSid,
-              (completeResponse) => {
-                if (
-                  cleanedUp ||
-                  timedOut ||
-                  verdictSubmitted ||
-                  !screeningCreated ||
-                  turnState !== "listening"
-                ) {
-                  console.log(
-                    "STT response ignored:",
-                    completeResponse
-                  );
-                  return;
-                }
-
-                turnState = "processing";
-
-                console.log(
-                  "Caller response:",
-                  completeResponse
-                );
-
-                submitCallerResponse(
-                  newCallSid,
-                  completeResponse
-                );
-
-                console.log(
-                  "Caller response saved"
-                );
-
-                void advanceConversation(
-                  newCallSid,
-                  newStreamSid
-                );
-              }
-            );
-
-            stt.connect();
-
-            // Start InterHoot's greeting.
-            void advanceConversation(
+            // Language, then STT and the greeting (see beginScreening).
+            void beginScreening(
               newCallSid,
               newStreamSid
             );
@@ -609,7 +832,7 @@ export function setupMediaWebSocket(server: Server): void {
               !sessionCreated ||
               !screeningCreated ||
               timedOut ||
-              verdictSubmitted
+              (verdictSubmitted && !takingMessage)
             ) {
               break;
             }
@@ -646,7 +869,7 @@ export function setupMediaWebSocket(server: Server): void {
               markName === expectedPlaybackMark &&
               turnState === "speaking" &&
               !timedOut &&
-              !verdictSubmitted
+              (!verdictSubmitted || takingMessage)
             ) {
               expectedPlaybackMark = null;
               turnState = "listening";
