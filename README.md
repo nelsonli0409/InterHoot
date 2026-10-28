@@ -2,6 +2,8 @@
 
 InterHoot answers phone calls before they reach an older or immigrant user. It screens each caller by voice in the user's language, checks the caller's claims against the user's credit file, and flags the call green, yellow or red. Green calls ring through. Yellow callers leave a message, and the user gets a push. Red callers are hung up on, and their number is blocked on the iPhone and rejected from then on.
 
+Check out the Devpost page [here](https://devpost.com/software/interhoot)
+
 ## How a call works
 
 1. The caller dials the InterHoot Twilio number. `scam-protection/` answers. It rejects hidden caller IDs and numbers already flagged red, so those calls never ring.
